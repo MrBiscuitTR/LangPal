@@ -96,7 +96,8 @@ const state = {
   busy: false,            // a turn is in flight
   stopPending: null,      // promise for an in-progress /api/stop
   chatController: null,
-  ttsControllers: new Set(),
+  aborters: new Set(),    // every in-flight fetch Stop should cancel
+  generation: 0,          // bumped by Stop; a turn from an older one is dropped
   detectedLanguage: '',
   sampleWav: null,        // ArrayBuffer of the clip in the voice form
 };
@@ -130,6 +131,7 @@ const tts = {
   streaming: false,       // the chat stream is still producing sentences
   running: false,         // the playback worker loop is alive
   source: null,           // currently playing AudioBufferSourceNode
+  finishCurrent: null,    // resolves the in-progress playDecoded promise
   startedAt: 0,           // when the current sentence began, for the grace window
 };
 
@@ -144,11 +146,12 @@ function setStatus(text, kind) {
   node.classList.toggle('is-live', kind === 'live');
 }
 
-async function api(path, body) {
+async function api(path, body, signal) {
   const resp = await fetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body || {}),
+    signal: signal,
   });
   let data = null;
   try { data = await resp.json(); } catch (err) { data = null; }
@@ -420,13 +423,22 @@ function onFrame(frame) {
   // interrupt while the model is still generating.
   if (state.busy && vad.mode === 'idle' && !isSpeaking()) return;
 
-  // Track how loud our own output returns while we are not mid-utterance.
-  // Peak-hold: jump straight to any new peak, decay gently otherwise.
-  if (isSpeaking() && vad.mode === 'idle') {
+  const loud = rms > currentThreshold();
+
+  // Track how loud our own output returns through the microphone.
+  //
+  // Only quiet frames count, for the same reason vad.floor ignores loud
+  // ones: a frame containing the user's voice would otherwise raise the
+  // floor, which raises the threshold above them, so the harder they talk
+  // the higher the bar climbs and barge-in can never fire.
+  //
+  // The exception is the grace window at the start of a sentence, where the
+  // floor has nothing to go on yet and every frame has to count to
+  // bootstrap it. Peak-hold: jump to any new peak, decay gently otherwise.
+  const bootstrapping = isSpeaking() && Date.now() - tts.startedAt < BARGE_GRACE_MS;
+  if (isSpeaking() && vad.mode === 'idle' && (bootstrapping || !loud)) {
     vad.echoFloor = Math.max(rms, vad.echoFloor * ECHO_DECAY);
   }
-
-  const loud = rms > currentThreshold();
 
   if (vad.mode === 'idle') {
     // Track the room's noise floor from quiet frames only, so a long sentence
@@ -441,14 +453,19 @@ function onFrame(frame) {
     }
 
     // The first moments of a sentence are the worst time to judge: the echo
-    // floor has not caught up with the new audio yet.
-    if (isSpeaking() && Date.now() - tts.startedAt < BARGE_GRACE_MS) {
+    // floor is still bootstrapping on the new audio.
+    if (bootstrapping) {
       vad.loudSamples = 0;
       return;
     }
 
     const needed = msToSamples(isSpeaking() ? BARGE_START_MS : SPEECH_START_MS, rate);
-    vad.loudSamples = loud ? vad.loudSamples + samples.length : 0;
+    // Decay rather than reset, so the brief dips between words inside a
+    // second of speech do not keep restarting the count from zero. Twice as
+    // fast as it builds, so scattered noise still never accumulates.
+    vad.loudSamples = loud
+      ? vad.loudSamples + samples.length
+      : Math.max(0, vad.loudSamples - samples.length * 2);
     if (vad.loudSamples >= needed) beginUtterance();
     return;
   }
@@ -525,12 +542,27 @@ async function submitAudio(samples, rate, reviewOnly) {
     if (state.stopPending) await state.stopPending;   // make sure epoch is current
     setStatus('transcribing…');
 
-    const pcm = resample(samples, rate, TARGET_RATE);
-    const wav = encodeWav(pcm, TARGET_RATE);
-    const result = await api('/api/stt', {
-      audio_b64: toBase64(new Uint8Array(wav)),
-      settings: settingsForRequest(),
-    });
+    const generation = state.generation;
+    const controller = new AbortController();
+    state.aborters.add(controller);
+    let result;
+    try {
+      const pcm = resample(samples, rate, TARGET_RATE);
+      const wav = encodeWav(pcm, TARGET_RATE);
+      result = await api('/api/stt', {
+        audio_b64: toBase64(new Uint8Array(wav)),
+        settings: settingsForRequest(),
+      }, controller.signal);
+    } catch (err) {
+      if (err.name === 'AbortError') return;   // Stop was pressed
+      throw err;
+    } finally {
+      state.aborters.delete(controller);
+    }
+
+    // Stop may have landed while the clip was being transcribed. Drop it
+    // rather than answering something the user has already abandoned.
+    if (state.generation !== generation) return;
 
     const text = (result.text || '').trim();
     if (!text) {
@@ -666,7 +698,7 @@ async function readSse(resp, onEvent) {
 
 async function fetchSentenceAudio(text) {
   const controller = new AbortController();
-  state.ttsControllers.add(controller);
+  state.aborters.add(controller);
   try {
     const resp = await fetch('/api/tts', {
       method: 'POST',
@@ -688,7 +720,7 @@ async function fetchSentenceAudio(text) {
     // means the buffer is ready the instant the previous sentence ends.
     return await decodeAudio(await resp.arrayBuffer());
   } finally {
-    state.ttsControllers.delete(controller);
+    state.aborters.delete(controller);
   }
 }
 
@@ -725,11 +757,24 @@ function playDecoded(decoded) {
     const source = audio.playCtx.createBufferSource();
     source.buffer = decoded;
     source.connect(audio.playCtx.destination);
-    source.onended = () => {
+
+    // This promise MUST settle on every path. If it does not, ttsWorker
+    // waits on it forever, tts.running stays true, and isSpeaking() is
+    // permanently true -- which leaves the microphone stuck in barge-in
+    // mode and the app silently deaf. Idempotent, so stopping mid-playback
+    // and the natural end cannot both resolve it twice.
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
       if (tts.source === source) tts.source = null;
+      if (tts.finishCurrent === finish) tts.finishCurrent = null;
       resolve();
     };
+
+    source.onended = finish;
     tts.source = source;
+    tts.finishCurrent = finish;   // stopEverything() calls this directly
     tts.startedAt = Date.now();
     source.start();
   });
@@ -794,6 +839,9 @@ async function ttsWorker() {
 // Halts playback, drops queued sentences, aborts in-flight requests and bumps
 // the server-side epoch so work already queued upstream is discarded too.
 function stopEverything() {
+  // Any turn already in flight belongs to the previous generation and must
+  // not carry on to the model once it comes back.
+  state.generation++;
   tts.pending.length = 0;
   tts.inflight.length = 0;
   tts.streaming = false;
@@ -801,17 +849,20 @@ function stopEverything() {
   if (tts.source) {
     const source = tts.source;
     tts.source = null;
-    source.onended = null;     // clear first: stop() fires onended
+    // Leave onended attached: stop() fires it, which settles the waiting
+    // playDecoded promise. Clearing it here is what used to hang the worker.
     try { source.stop(); } catch (err) { /* already finished */ }
     try { source.disconnect(); } catch (err) { /* already detached */ }
   }
+  // Belt and braces: settle it ourselves in case onended does not fire.
+  if (tts.finishCurrent) tts.finishCurrent();
 
   if (state.chatController) {
     state.chatController.abort();
     state.chatController = null;
   }
-  for (const controller of state.ttsControllers) controller.abort();
-  state.ttsControllers.clear();
+  for (const controller of state.aborters) controller.abort();
+  state.aborters.clear();
 
   el('btn-stop').disabled = true;
   setStatus(state.listening ? 'ready' : 'idle', state.listening ? 'live' : null);
@@ -1202,7 +1253,13 @@ function closePanel(id) {
 
 function wire() {
   el('btn-mic').addEventListener('click', toggleMic);
-  el('btn-stop').addEventListener('click', stopEverything);
+  el('btn-stop').addEventListener('click', () => {
+    stopEverything();
+    // Discard anything half-captured, so the next thing said is a clean
+    // turn. Barge-in deliberately does not do this: it keeps the pre-roll,
+    // which is the start of what the user is saying.
+    resetVad();
+  });
 
   el('text-form').addEventListener('submit', (event) => {
     event.preventDefault();

@@ -404,6 +404,13 @@ SECURITY_HEADERS = {
 # Errors
 # ---------------------------------------------------------------------------
 
+# Raised when the client has gone away mid-response. ssl.SSLError is in here
+# because a TLS socket whose peer vanished raises ssl.SSLEOFError, which is not
+# a BrokenPipeError and so slipped through the old handling entirely.
+CONNECTION_ERRORS = (BrokenPipeError, ConnectionResetError, ssl.SSLError,
+                     TimeoutError)
+
+
 class BadRequest(Exception):
     """Client sent something invalid. Becomes a 400."""
 
@@ -1417,6 +1424,22 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, status, message):
         self._send_json(status, {"error": message})
 
+    def _try_error(self, status, message):
+        """Send an error response, tolerating a client that has already left.
+
+        Aborting a fetch -- which the Stop button does to every request in
+        flight -- closes the socket while the handler may still be working.
+        Writing the reply then raises, and because that write happens inside an
+        `except` block, the new exception escapes the handler's own error
+        handling and unwinds all the way into socketserver, printing a
+        traceback for what is really just a client that hung up.
+        """
+        try:
+            self._error(status, message)
+        except CONNECTION_ERRORS:
+            pass
+        return None
+
     def _read_body(self) -> bytes:
         """Read exactly Content-Length bytes, refusing oversized bodies."""
         raw_len = self.headers.get("Content-Length")
@@ -1543,22 +1566,20 @@ class Handler(BaseHTTPRequestHandler):
                     return route()
             return self._error(404, "not found")
         except TooLarge as exc:
-            return self._error(413, str(exc))
+            return self._try_error(413, str(exc))
         except BadRequest as exc:
-            return self._error(400, str(exc))
+            return self._try_error(400, str(exc))
         except UpstreamError as exc:
-            return self._error(502, str(exc))
+            return self._try_error(502, str(exc))
         except Aborted:
-            return self._error(409, "stopped")
-        except (BrokenPipeError, ConnectionResetError):
+            # Routine: the Stop button invalidated this request mid-flight.
+            return self._try_error(409, "stopped")
+        except CONNECTION_ERRORS:
             return None                        # client hung up; nothing to say
         except Exception as exc:               # noqa: BLE001 - last-resort guard
             # Log the detail locally, tell the client only that it broke.
             self.log_message("unhandled error on %s: %r", path, exc)
-            try:
-                return self._error(500, "internal error")
-            except Exception:                  # noqa: BLE001
-                return None
+            return self._try_error(500, "internal error")
 
     # -- handlers ----------------------------------------------------------
 

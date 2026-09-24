@@ -684,6 +684,82 @@ class BargeInThresholds(unittest.TestCase):
         self.assertGreaterEqual(self._timing("BARGE_GRACE_MS"), 100)
         self.assertLessEqual(total, 2000)
 
+class ConnectionErrorHandling(unittest.TestCase):
+    """A client that hangs up must not produce a traceback."""
+
+    def test_tls_eof_is_treated_as_a_lost_connection(self):
+        # ssl.SSLEOFError is what a TLS socket raises when the peer vanishes.
+        # It is not a BrokenPipeError, which is how it used to escape.
+        import ssl
+        self.assertTrue(issubclass(ssl.SSLEOFError, langpal.CONNECTION_ERRORS))
+        self.assertTrue(issubclass(BrokenPipeError, langpal.CONNECTION_ERRORS))
+        self.assertTrue(issubclass(ConnectionResetError, langpal.CONNECTION_ERRORS))
+
+    def test_try_error_swallows_a_dead_socket(self):
+        import ssl
+
+        class DeadSocketHandler:
+            _try_error = langpal.Handler._try_error
+
+            def _error(self, status, message):
+                raise ssl.SSLEOFError("EOF occurred in violation of protocol")
+
+        # Must return rather than propagate: this runs inside an `except`
+        # block, where a new exception escapes the handler entirely.
+        self.assertIsNone(DeadSocketHandler()._try_error(409, "stopped"))
+
+    def test_try_error_still_raises_real_bugs(self):
+        class BrokenHandler:
+            _try_error = langpal.Handler._try_error
+
+            def _error(self, status, message):
+                raise ValueError("a real bug, not a dead socket")
+
+        with self.assertRaises(ValueError):
+            BrokenHandler()._try_error(500, "internal error")
+
+
+class ClientInvariants(unittest.TestCase):
+    """Checks on web/app.js that no Python test can make for us.
+
+    Both of these fail silently in the browser: nothing crashes, the app just
+    stops responding to the microphone. They are cheap to assert on the source
+    and expensive to notice any other way.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = io.open(os.path.join(langpal.WEB_DIR, "app.js"),
+                             encoding="utf-8").read()
+
+    def test_playback_promise_cannot_be_orphaned(self):
+        """Clearing onended before stop() hangs ttsWorker forever.
+
+        With no `ended` event the playDecoded promise never settles, so
+        tts.running stays true, isSpeaking() stays true, and the microphone is
+        stuck in barge-in mode for the rest of the session.
+        """
+        self.assertNotIn("source.onended = null", self.source,
+                         "stop() must be allowed to fire onended")
+        self.assertIn("tts.finishCurrent", self.source,
+                      "stopEverything must be able to settle the promise itself")
+
+    def test_echo_floor_ignores_loud_frames(self):
+        """Learning from loud frames makes barge-in impossible.
+
+        A frame carrying the user's voice would raise the echo floor, which
+        raises the threshold above them -- so the harder they talk, the higher
+        the bar climbs.
+        """
+        self.assertIn("bootstrapping || !loud", self.source,
+                      "the echo floor must only learn from quiet frames, "
+                      "except while bootstrapping at the start of a sentence")
+
+    def test_stop_invalidates_an_in_flight_turn(self):
+        self.assertIn("state.generation++", self.source)
+        self.assertIn("state.generation !== generation", self.source,
+                      "a turn transcribed across a Stop must be abandoned")
+
 class ConfigExposure(unittest.TestCase):
     def test_no_secret_leaks_into_the_client_payload(self):
         blob = json.dumps(langpal.default_settings())
