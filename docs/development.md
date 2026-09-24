@@ -115,6 +115,7 @@ Constants at the top of `web/app.js`:
 | `PREROLL_MS` | 320 | Audio kept from before speech began. Raise if first words are clipped. |
 | `PREROLL_CAP_MS` | derived | `max(PREROLL_MS, BARGE_START_MS) + 250`. Never hard-code it: the ring must outlast whichever start window is longer. |
 | `MIN_UTTERANCE_MS` | 350 | Below this, discarded as a cough. |
+| `MAX_TURN_SECONDS` | 240 | Ceiling for the configurable turn length. Bounded by the request body limit, not the model — see configuration.md. |
 | `NOISE_FLOOR_MULT` | 3.2 | How far speech must beat the room. |
 | `MIN_RMS` | 0.012 | Absolute floor for very quiet rooms. |
 | `BARGE_MULT` | 2.2 | Extra margin so the reply cannot trigger itself. |

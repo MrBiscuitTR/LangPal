@@ -348,7 +348,11 @@ SENTENCE_ABBREVIATIONS = (
 # base64 inside JSON, which costs ~33% over the raw bytes; the caps below
 # account for that.
 MAX_REQUEST_BYTES = 12 * 1024 * 1024     # any single request body
-MAX_UTTERANCE_SECONDS = 90               # one spoken turn
+# One spoken turn. Measured against Qwen3-ASR on distinct speech: clean to at
+# least 171 s, full coverage, ~19 characters per second of audio and about 3 s
+# to transcribe. The browser caps itself lower and this is the backstop; the
+# real ceiling is MAX_REQUEST_BYTES, since base64 audio is ~43 kB per second.
+MAX_UTTERANCE_SECONDS = 240
 MAX_VOICE_SAMPLE_SECONDS = 120           # a voice-cloning reference clip
 MAX_USER_TEXT_CHARS = 8000
 MAX_TTS_TEXT_CHARS = 2000

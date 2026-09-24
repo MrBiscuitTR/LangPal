@@ -164,12 +164,13 @@ Stored in `localStorage`, never sent to the server.
 | --- | --- | --- |
 | Silence that ends a turn | 900 ms | 200–5000 |
 | Mic sensitivity | 5 | 1–10; higher lowers the threshold |
+| Longest single turn | 150 s | 15–240; see below |
 | Let me interrupt | on | off = microphone muted while the reply plays |
 | Send automatically | on | off = the turn is captured but not sent |
 
 Fixed tuning constants live at the top of `web/app.js`: `SPEECH_START_MS`
 (140), `BARGE_START_MS` (1000), `PREROLL_MS` (320), `MIN_UTTERANCE_MS` (350),
-`MAX_UTTERANCE_MS` (60000), `NOISE_FLOOR_MULT` (3.2), `BARGE_MULT` (1.6),
+`NOISE_FLOOR_MULT` (3.2), `BARGE_MULT` (1.6),
 `ECHO_MULT` (2.0), `ECHO_GAIN_RISE` (0.10), `ECHO_GAIN_FALL` (0.02),
 `ECHO_LAG_S` (0.06), `ECHO_WINDOW_S` (0.06), `BARGE_HOLD_MS` (600),
 `BARGE_GRACE_MS` (300).
@@ -178,6 +179,43 @@ Fixed tuning constants live at the top of `web/app.js`: `SPEECH_START_MS`
 The pre-roll ring has to reach back to the moment speech might have started,
 which is the longer of the two start windows. Hard-coding it would mean raising
 `BARGE_START_MS` silently truncated every interruption.
+
+### How long a turn can be
+
+A turn ends when you stop talking, or when it hits the length cap — whichever
+comes first. Hitting the cap sends what you said so far and says so in the
+transcript, rather than cutting you off with no explanation.
+
+**The cap is LangPal's, not the model's.** Qwen3-ASR happily transcribes far
+longer material — whole songs, if you feed it through llama-swap's own UI. 171 s
+below is simply where the measurement stopped, not where quality fell off:
+coverage and throughput were still flat there.
+
+| Audio | Transcribed | Coverage |
+| --- | --- | --- |
+| 120 s | 2.1 s | 27/28 topics |
+| 150 s | 2.6 s | 34/35 topics |
+| 171 s | 3.1 s | 38/40 topics |
+
+Repeated *identical* audio does degenerate — 178 s of one looping sentence came
+back as 29,574 characters with the ending missing — but that is the repetition,
+not the length, and real speech does not look like that.
+
+The ceiling is **transport**, and it is self-imposed. LangPal uploads audio as
+base64 inside a JSON body, which inflates it by a third; at 32 kB/s for 16 kHz
+mono 16-bit, `MAX_REQUEST_BYTES` is reached at about 295 s. The maximum is set
+to 240 s to leave room, and `MAX_UTTERANCE_SECONDS` on the server matches.
+
+Base64-in-JSON is a deliberate trade, made so the server never has to parse
+multipart — only build it (see [architecture.md](architecture.md)). It costs a
+third of the bandwidth on a local network, which is cheap, and this ceiling,
+which only matters for material far longer than a spoken turn. Going beyond
+240 s means changing the upload format or raising `MAX_REQUEST_BYTES`; neither
+is worth it for conversation practice, where turns run to seconds.
+
+Three limits therefore have to agree, in three different files, so
+`tests/test_langpal.py::TurnLengthLimits` checks them against each other —
+raising the browser's cap alone fails the suite.
 
 ### How interruption works
 

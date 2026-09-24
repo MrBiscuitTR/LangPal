@@ -835,6 +835,73 @@ class TurnCancellation(unittest.TestCase):
                     handler._turn_id({"turn": bad})
 
 
+class TurnLengthLimits(unittest.TestCase):
+    """Three limits have to agree, and they live in three different files."""
+
+    @classmethod
+    def setUpClass(cls):
+        import re
+        cls.source = io.open(os.path.join(langpal.WEB_DIR, "app.js"),
+                             encoding="utf-8").read()
+        cls.client_max = float(re.search(r"const MAX_TURN_SECONDS = ([0-9.]+);",
+                                         cls.source).group(1))
+        cls.client_min = float(re.search(r"const MIN_TURN_SECONDS = ([0-9.]+);",
+                                         cls.source).group(1))
+
+    def test_the_server_accepts_everything_the_browser_can_send(self):
+        self.assertLessEqual(self.client_max, langpal.MAX_UTTERANCE_SECONDS,
+                             "the browser would produce turns the server rejects")
+
+    def test_the_longest_turn_fits_in_a_request(self):
+        """The real ceiling is transport, not the model.
+
+        16 kHz mono 16-bit is 32 kB/s and base64 adds a third, so the body
+        limit caps the turn length well before the ASR model does. Raising one
+        without the other yields a turn that records fine and then fails on
+        upload.
+        """
+        raw = self.client_max * 16000 * 2
+        encoded = (raw + 2) // 3 * 4
+        self.assertLess(encoded, langpal.MAX_REQUEST_BYTES,
+                        "a maximum-length turn would exceed the body limit")
+
+    def test_bounds_are_sane(self):
+        self.assertGreater(self.client_max, self.client_min)
+        self.assertGreaterEqual(self.client_min, 10)
+
+    def test_the_default_is_within_the_bounds(self):
+        import re
+        default = float(re.search(r"maxTurnSeconds: ([0-9.]+),",
+                                  self.source).group(1))
+        self.assertGreaterEqual(default, self.client_min)
+        self.assertLessEqual(default, self.client_max)
+
+    def test_the_cap_measures_speech_not_the_preroll(self):
+        """The pre-roll is over a second of lead-in.
+
+        Counting it against the limit would quietly shorten every turn by that
+        much, and the figure shown in the warning would be wrong.
+        """
+        self.assertIn("vad.totalSamples - vad.seededSamples >= msToSamples(maxTurnMs()",
+                      self.source)
+
+    def test_hitting_the_cap_is_explained(self):
+        self.assertIn("second limit and was sent as it stood", self.source,
+                      "being cut off mid-sentence with no message reads as a bug")
+
+    def test_server_rejects_an_overlong_clip(self):
+        long_enough = make_wav(langpal.MAX_UTTERANCE_SECONDS + 1, rate=8000)
+        with self.assertRaises(langpal.BadRequest):
+            langpal.inspect_wav(long_enough,
+                                max_seconds=langpal.MAX_UTTERANCE_SECONDS)
+
+    def test_server_accepts_a_clip_at_the_limit(self):
+        at_limit = make_wav(langpal.MAX_UTTERANCE_SECONDS - 1, rate=8000)
+        self.assertGreater(
+            langpal.inspect_wav(at_limit, max_seconds=langpal.MAX_UTTERANCE_SECONDS),
+            0)
+
+
 class ConnectionErrorHandling(unittest.TestCase):
     """A client that hangs up must not produce a traceback."""
 

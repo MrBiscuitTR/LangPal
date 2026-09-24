@@ -33,7 +33,12 @@ const SPEECH_START_MS = 140;      // sustained speech before a turn opens
 // much more annoying than taking a moment to be sure. It keeps talking
 // through the window, then stops outright when the second is up.
 const BARGE_START_MS = 1000;      // how long you must be talking to interrupt
-const MAX_UTTERANCE_MS = 60000;   // hard stop, below the server's 90 s limit
+// Bounds for the configurable turn length. The ceiling is set by transport,
+// not by the model: 16 kHz mono audio is 32 kB/s, base64 inflates it by a
+// third, and the server refuses bodies over 12 MiB -- which works out at
+// about 295 s. 240 s leaves room for the rest of the request.
+const MIN_TURN_SECONDS = 15;
+const MAX_TURN_SECONDS = 240;
 const PREROLL_MS = 320;           // audio kept from just before speech began
 // The ring has to hold everything back to the moment speech might have
 // started, which is the longest of the two start windows -- otherwise the
@@ -89,6 +94,7 @@ const MAX_TTS_INFLIGHT = 2;
 
 const DEFAULT_LOCAL = {
   silenceMs: 900,                 // silence that ends a turn
+  maxTurnSeconds: 150,            // hard stop for one turn; see the note above
   sensitivity: 5,                 // 1 (least) .. 10 (most)
   bargeIn: true,                  // allow interrupting the assistant
   autoSend: true,                 // send as soon as the turn ends
@@ -198,6 +204,13 @@ function toBase64(bytes) {
 }
 
 const msToSamples = (ms, rate) => Math.round((ms / 1000) * rate);
+
+// Clamped on read rather than on write: a value edited straight into
+// localStorage should not be able to produce a request the server refuses.
+function maxTurnMs() {
+  const seconds = Number(state.local.maxTurnSeconds) || DEFAULT_LOCAL.maxTurnSeconds;
+  return Math.min(MAX_TURN_SECONDS, Math.max(MIN_TURN_SECONDS, seconds)) * 1000;
+}
 
 // Identifies one reply, so Stop can revoke exactly that work on the server.
 // Generated here rather than counted on both sides: a number the browser and
@@ -617,9 +630,11 @@ function onFrame(frame) {
   vad.quietSamples = loud ? 0 : vad.quietSamples + samples.length;
 
   if (vad.quietSamples >= msToSamples(state.local.silenceMs, rate)) {
-    endUtterance();
-  } else if (vad.totalSamples >= msToSamples(MAX_UTTERANCE_MS, rate)) {
-    endUtterance();
+    endUtterance(false);
+  } else if (vad.totalSamples - vad.seededSamples >= msToSamples(maxTurnMs(), rate)) {
+    // Measured on the speech, not the clip: the pre-roll is over a second
+    // of lead-in and should not count against what the user said.
+    endUtterance(true);
   }
 }
 
@@ -644,7 +659,7 @@ function beginUtterance() {
   setStatus(interrupting ? 'interrupted, listening…' : 'listening…', 'live');
 }
 
-function endUtterance() {
+function endUtterance(hitLimit) {
   const samples = concatChunks(vad.chunks, vad.totalSamples);
   const rate = audio.rate;
   // Length of the speech itself, excluding the pre-roll lead-in. Measuring the
@@ -657,6 +672,11 @@ function endUtterance() {
   if (ms < MIN_UTTERANCE_MS) {
     setStatus(state.listening ? 'ready' : 'idle');
     return;
+  }
+  if (hitLimit) {
+    // Say so. Being cut off mid-sentence with no explanation reads as a bug.
+    note('that turn reached the ' + Math.round(maxTurnMs() / 1000)
+       + ' second limit and was sent as it stood (Settings, Listening)');
   }
   submitAudio(samples, rate, !state.local.autoSend).catch((err) => {
     setStatus(String(err.message || err), 'error');
