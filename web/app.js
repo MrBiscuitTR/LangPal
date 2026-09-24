@@ -27,11 +27,12 @@ const TARGET_RATE = 16000;        // what we send to the ASR model
 const VOICE_SAMPLE_RATE = 24000;  // reference clips: match OmniVoice's own rate
 
 const SPEECH_START_MS = 140;      // sustained speech before a turn opens
-// Interrupting takes a full second of sustained speech. It is deliberately
+// Interrupting takes a second of talking, measured as elapsed time rather
+// than a run of loud frames -- see the note on BARGE_HOLD_MS. Deliberately
 // far stricter than SPEECH_START_MS: cutting the assistant off by mistake is
-// much more annoying than taking a moment to be sure. The assistant keeps
-// talking during this window, then stops at once when the second is up.
-const BARGE_START_MS = 1000;      // sustained speech needed to interrupt
+// much more annoying than taking a moment to be sure. It keeps talking
+// through the window, then stops outright when the second is up.
+const BARGE_START_MS = 1000;      // how long you must be talking to interrupt
 const MAX_UTTERANCE_MS = 60000;   // hard stop, below the server's 90 s limit
 const PREROLL_MS = 320;           // audio kept from just before speech began
 // The ring has to hold everything back to the moment speech might have
@@ -54,17 +55,25 @@ const FLOOR_ATTACK = 0.02;        // how fast the noise floor tracks the room
 // A separate peak-hold floor tracks how loud our output comes back: it rises
 // instantly and decays slowly, so it stays high through the gaps between
 // sentences instead of collapsing and re-triggering on the next one.
-// Asymmetric envelope follower: rises quickly so a sentence's echo is
-// tracked within a few frames, falls slowly so it does not collapse during
-// the pauses between words and let the next burst look like speech.
-//
-// Deliberately not a peak-hold. Holding the peak latches onto the loudest
-// frame of the sentence, and speech peaks run three to four times its
-// average -- so the bar ended up around five times the average echo, which
-// a person talking through a speaker cannot clear.
-const ECHO_RISE = 0.30;           // per frame, towards a louder measurement
-const ECHO_FALL = 0.02;           // per frame, towards a quieter one
-const ECHO_MULT = 2.0;            // speech must beat the echo envelope by this
+// Expected echo is computed from the buffer we are playing, not inferred
+// from the microphone. ECHO_GAIN is the coupling between the two -- how
+// much of what we play comes back -- learned continuously, because it
+// depends on the speakers, the volume and the room.
+const ECHO_MULT = 2.0;            // speech must beat the expected echo by this
+const ECHO_GAIN_INIT = 0.5;       // starting guess before anything is learned
+const ECHO_GAIN_RISE = 0.10;      // per frame, towards a stronger coupling
+const ECHO_GAIN_FALL = 0.02;      // per frame, towards a weaker one
+// The microphone hears a sample later than we scheduled it: output buffering
+// plus the trip through the air. Read the playback envelope from slightly
+// behind the playhead, over a window wide enough to forgive the estimate.
+const ECHO_LAG_S = 0.06;
+const ECHO_WINDOW_S = 0.06;
+
+// How long evidence of speech survives without a fresh frame above the bar.
+// Generous, because while the assistant is talking the bar only drops in the
+// gaps between its words -- so a person talking steadily is detected in
+// bursts, with the assistant's own syllables masking them in between.
+const BARGE_HOLD_MS = 600;
 const BARGE_GRACE_MS = 300;       // deaf at the start of a sentence, while
                                   // the echo floor is still converging. Short
                                   // because the floor is peak-held and so
@@ -128,7 +137,9 @@ const audio = {
 const vad = {
   mode: 'idle',           // idle | speech
   floor: MIN_RMS,
-  echoFloor: 0,           // how loud our own playback returns through the mic
+  echoGain: ECHO_GAIN_INIT,  // learned coupling: mic level per unit of playback
+  speechSince: 0,            // when the current run of evidence began
+  lastLoudAt: 0,             // last frame that cleared the bar
   chunks: [],
   totalSamples: 0,
   seededSamples: 0,       // how much of chunks came from the pre-roll, not speech
@@ -145,6 +156,9 @@ const tts = {
   running: false,         // the playback worker loop is alive
   source: null,           // currently playing AudioBufferSourceNode
   finishCurrent: null,    // resolves the in-progress playDecoded promise
+  channel: null,          // samples of the playing buffer, for echo prediction
+  channelRate: 0,         // its sample rate
+  playStartedAt: 0,       // playCtx.currentTime when it started
   startedAt: 0,           // when the current sentence began, for the grace window
 };
 
@@ -316,19 +330,46 @@ function concatChunks(chunks, total) {
  * Microphone capture and voice activity detection
  * ------------------------------------------------------------------------- */
 
+// RMS of the audio we are playing right now, as the microphone should be
+// hearing it. Zero when nothing is playing, and -- crucially -- near zero
+// in the pauses between words, which is where interruptions get detected.
+function playbackLevel() {
+  if (!tts.channel || !audio.playCtx) return 0;
+  const elapsed = audio.playCtx.currentTime - tts.playStartedAt - ECHO_LAG_S;
+  if (elapsed < 0) return 0;
+
+  const data = tts.channel;
+  const rate = tts.channelRate;
+  const half = Math.round((ECHO_WINDOW_S * rate) / 2);
+  const centre = Math.round(elapsed * rate);
+  const from = Math.max(0, centre - half);
+  const to = Math.min(data.length, centre + half);
+  if (to <= from) return 0;
+
+  let sum = 0;
+  for (let i = from; i < to; i++) sum += data[i] * data[i];
+  return Math.sqrt(sum / (to - from));
+}
+
+// What the microphone should be picking up from us alone.
+function expectedEcho() {
+  return playbackLevel() * vad.echoGain;
+}
+
 function currentThreshold() {
   // Higher sensitivity lowers the bar. 0.85^(s-5) maps 1..10 to ~1.9..0.44.
   const sensMul = Math.pow(0.85, (state.local.sensitivity || 5) - 5);
   const base = Math.max(vad.floor * NOISE_FLOOR_MULT, MIN_RMS) * sensMul;
   if (!audioAudible()) return base;
   // While sound is playing, the bar is whichever is higher: the usual
-  // threshold with a little extra margin, or a margin above the measured
-  // echo envelope. The second term adapts to speaker volume and the room.
+  // threshold with a little margin, or a margin above the echo we predict
+  // from the buffer itself. In a pause the second term collapses and this
+  // becomes ordinary listening.
   //
   // sensMul applies to both terms. It used to scale only the first, which
   // made Mic sensitivity do nothing whatsoever for interrupting -- the one
   // knob a user reaches for when barge-in will not fire.
-  return Math.max(base * BARGE_MULT, vad.echoFloor * ECHO_MULT * sensMul);
+  return Math.max(base * BARGE_MULT, expectedEcho() * ECHO_MULT * sensMul);
 }
 
 // Is a reply in progress at all? True from the first sentence being queued
@@ -438,6 +479,35 @@ function resetVad() {
   vad.prerollSamples = 0;
   vad.loudSamples = 0;
   vad.quietSamples = 0;
+  vad.speechSince = 0;
+  vad.lastLoudAt = 0;
+}
+
+// Populated only while the settings panel is open, and throttled: this is a
+// diagnostic, not something to spend a render quantum on.
+let readoutDue = 0;
+
+function updateReadout(rms, threshold) {
+  const node = el('vad-readout');
+  if (!node || el('settings').hidden) return;
+  const now = Date.now();
+  if (now < readoutDue) return;
+  readoutDue = now + 100;
+
+  const pct = (v) => (v * 1000).toFixed(1);
+  let held = '';
+  if (replyActive()) {
+    const secs = vad.speechSince ? (now - vad.speechSince) / 1000 : 0;
+    held = '  |  talking ' + secs.toFixed(1) + '/' +
+           (BARGE_START_MS / 1000).toFixed(1) + 's';
+  }
+  node.textContent =
+    'level ' + pct(rms) +
+    '  |  bar ' + pct(threshold) +
+    '  |  room ' + pct(vad.floor) +
+    '  |  echo ' + pct(expectedEcho()) +
+    '  |  ' + (rms > threshold ? 'HEARD' : 'below') +
+    (audioAudible() ? '  |  speaking' : '') + held;
 }
 
 function onFrame(frame) {
@@ -460,22 +530,27 @@ function onFrame(frame) {
   // interrupt while the model is still generating.
   if (state.busy && vad.mode === 'idle' && !replyActive()) return;
 
-  const loud = rms > currentThreshold();
+  const threshold = currentThreshold();
+  const loud = rms > threshold;
+  updateReadout(rms, threshold);
 
-  // Track how loud our own output returns through the microphone.
+  // Learn how much of what we play comes back, from frames that look like
+  // echo alone. Loud frames are skipped: one carrying the user's voice would
+  // inflate the coupling, raising the bar above them, so the harder they
+  // talked the further out of reach it would get.
   //
-  // Only quiet frames count, for the same reason vad.floor ignores loud
-  // ones: a frame containing the user's voice would otherwise raise the
-  // floor, which raises the threshold above them, so the harder they talk
-  // the higher the bar climbs and barge-in can never fire.
-  //
-  // The exception is the grace window at the start of a sentence, where the
-  // floor has nothing to go on yet and every frame has to count to
-  // bootstrap it. Peak-hold: jump to any new peak, decay gently otherwise.
+  // Only worth measuring while the playback is loud enough to dominate.
   const bootstrapping = audioAudible() && Date.now() - tts.startedAt < BARGE_GRACE_MS;
-  if (audioAudible() && vad.mode === 'idle' && (bootstrapping || !loud)) {
-    const rate = rms > vad.echoFloor ? ECHO_RISE : ECHO_FALL;
-    vad.echoFloor += (rms - vad.echoFloor) * rate;
+  const playing = playbackLevel();
+  // The measurement is rms / playing, so a quiet playback frame divides by
+  // almost nothing and throws the estimate wildly off. Only measure where
+  // our own output clearly dominates whatever else is in the room.
+  const measurable = playing > Math.max(MIN_RMS * 2, vad.floor * 4);
+  if (audioAudible() && vad.mode === 'idle' && measurable &&
+      (bootstrapping || !loud)) {
+    const observed = rms / playing;
+    const step = observed > vad.echoGain ? ECHO_GAIN_RISE : ECHO_GAIN_FALL;
+    vad.echoGain += (observed - vad.echoGain) * step;
   }
 
   if (vad.mode === 'idle') {
@@ -506,18 +581,33 @@ function onFrame(frame) {
       return;
     }
 
-    // A reply still being synthesised is silent, but cancelling it is just
-    // as disruptive as cutting off audio, so it takes the same deliberate
-    // second of speech.
-    const needed = msToSamples(replyActive() ? BARGE_START_MS : SPEECH_START_MS, rate);
-    // Decay rather than reset, so the brief dips between words inside a
-    // second of speech do not keep restarting the count from zero. Faster
-    // than it builds, so scattered noise still never accumulates, but not
-    // so fast that speech hovering near the bar can never reach it.
+    if (replyActive()) {
+      // Interrupting is judged on elapsed time, not on a run of loud frames.
+      // While the assistant is talking the bar only drops in the gaps between
+      // its words, so a person speaking normally is detected in bursts. A run
+      // of loud frames is therefore unsatisfiable however long they talk --
+      // only shouting one continuous note ever managed it.
+      const now = Date.now();
+      if (loud) {
+        if (!vad.speechSince) vad.speechSince = now;
+        vad.lastLoudAt = now;
+      } else if (vad.speechSince && now - vad.lastLoudAt > BARGE_HOLD_MS) {
+        vad.speechSince = 0;   // they stopped; the evidence lapses
+      }
+      if (vad.speechSince && now - vad.speechSince >= BARGE_START_MS) {
+        beginUtterance();
+      }
+      return;
+    }
+
+    // Starting an ordinary turn, with nothing playing to mask it. Here a run
+    // of loud frames is exactly the right test, and much harder for a stray
+    // noise to fake. Decay rather than reset, so the dips between words do
+    // not keep restarting the count.
     vad.loudSamples = loud
       ? vad.loudSamples + samples.length
       : Math.max(0, vad.loudSamples - samples.length * 1.5);
-    if (vad.loudSamples >= needed) beginUtterance();
+    if (vad.loudSamples >= msToSamples(SPEECH_START_MS, rate)) beginUtterance();
     return;
   }
 
@@ -835,6 +925,9 @@ function playDecoded(decoded) {
     source.onended = finish;
     tts.source = source;
     tts.finishCurrent = finish;   // stopEverything() calls this directly
+    tts.channel = decoded.getChannelData(0);
+    tts.channelRate = decoded.sampleRate;
+    tts.playStartedAt = audio.playCtx.currentTime;
     tts.startedAt = Date.now();
     source.start();
   });
@@ -847,8 +940,9 @@ function startTtsWorker() {
     if (err && err.name !== 'AbortError') setStatus(String(err.message || err), 'error');
   }).finally(() => {
     tts.running = false;
-    // Forget the echo level; the next reply measures its own.
-    vad.echoFloor = 0;
+    // The reply is over: stop predicting echo from a buffer that has
+    // finished playing.
+    tts.channel = null;
     el('btn-stop').disabled = true;
     if (state.listening) setStatus('ready', 'live');
   });
@@ -919,6 +1013,8 @@ function stopEverything() {
   }
   // Belt and braces: settle it ourselves in case onended does not fire.
   if (tts.finishCurrent) tts.finishCurrent();
+
+  tts.channel = null;
 
   if (state.chatController) {
     state.chatController.abort();

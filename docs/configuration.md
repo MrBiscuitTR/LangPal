@@ -170,67 +170,95 @@ Stored in `localStorage`, never sent to the server.
 Fixed tuning constants live at the top of `web/app.js`: `SPEECH_START_MS`
 (140), `BARGE_START_MS` (1000), `PREROLL_MS` (320), `MIN_UTTERANCE_MS` (350),
 `MAX_UTTERANCE_MS` (60000), `NOISE_FLOOR_MULT` (3.2), `BARGE_MULT` (1.6),
-`ECHO_MULT` (2.0), `ECHO_RISE` (0.30), `ECHO_FALL` (0.02), `BARGE_GRACE_MS`
-(300).
+`ECHO_MULT` (2.0), `ECHO_GAIN_RISE` (0.10), `ECHO_GAIN_FALL` (0.02),
+`ECHO_LAG_S` (0.06), `ECHO_WINDOW_S` (0.06), `BARGE_HOLD_MS` (600),
+`BARGE_GRACE_MS` (300).
 
 `PREROLL_CAP_MS` is derived, not set: `max(PREROLL_MS, BARGE_START_MS) + 250`.
 The pre-roll ring has to reach back to the moment speech might have started,
 which is the longer of the two start windows. Hard-coding it would mean raising
 `BARGE_START_MS` silently truncated every interruption.
 
-### How the assistant avoids interrupting itself
+### How interruption works
 
-The room's noise floor only adapts on quiet frames, so it freezes as soon as
-playback starts. On its own that leaves the bar where a silent room put it,
-which the assistant's own voice through a speaker clears easily -- the reply
-then cuts itself off a word in.
+Two problems pull against each other: the assistant must not cut itself off on
+its own echo, and you must be able to cut it off whenever you like.
 
-So a second **echo floor** tracks how loud our own output comes back through
-the microphone, as an asymmetric envelope follower: it rises quickly
-(`ECHO_RISE`) so a sentence is tracked within a few frames, and falls slowly
-(`ECHO_FALL`) so it does not collapse in the pauses between words.
+Earlier versions tried to infer the echo level from the microphone and set a
+bar above it. That is guesswork, and it fails completely if the browser's echo
+canceller is attenuating the microphone during playback — no threshold can
+recover a signal that is not there.
 
-It deliberately does *not* hold the peak. An earlier version did, and since
-speech peaks run three to four times its average, the bar landed at roughly
-five times the average echo — which nobody talking through a speaker can
-clear, so barge-in simply never fired.
-
-It also only learns from frames that are *below* the current threshold, the
-same rule the room floor uses. Learning from loud frames means a frame carrying
-the user's voice raises the floor, which raises the bar above them: the harder
-they talk, the further out of reach it gets.
-
-The bar while sound is audible is whichever is higher:
+So the echo is **predicted from the buffer being played** instead. We know
+exactly what we are sending to the speaker, so `playbackLevel()` reads its RMS
+at the current playhead (a little behind it, and over a wide window, to allow
+for output buffering and the trip through the air). Multiply by `vad.echoGain`, a
+coupling factor learned continuously from quiet frames, and that is what the
+microphone should be hearing from us alone:
 
 ```
 max(room_floor x NOISE_FLOOR_MULT x BARGE_MULT,
-    echo_floor x ECHO_MULT) x sensitivity
+    predicted_echo x ECHO_MULT) x sensitivity
 ```
+
+The payoff is the pauses. Between words the playback level goes to nothing, the
+second term collapses, and the bar drops to ordinary listening — speech is then
+unmistakable. Someone talking over a reply reaches such a gap within a few
+hundred milliseconds.
 
 Mic sensitivity scales **both** terms. Scaling only the first left the control
 with no effect whatsoever on interrupting, which is exactly when someone would
-reach for it. If barge-in is reluctant on your setup, raise it.
+reach for it.
 
-Note "audible", not "replying": a sentence still being synthesised makes no
-sound, so it contributes no echo and uses the ordinary threshold. Cancelling it
-still takes the full `BARGE_START_MS`, because abandoning a reply is just as
-disruptive whether or not it has started coming out of the speaker.
+The room floor (`vad.floor`) is frozen whenever our own audio is audible. It
+skips loud frames, but once the echo term raises the bar the echo itself counts
+as quiet, so it was being learnt as room noise — within half a second the floor
+had climbed to the echo level and `base x BARGE_MULT` swamped everything else.
+That was a second, slower route to the same deadlock.
 
-`BARGE_MULT` is deliberately small: echo rejection is `ECHO_MULT`'s job, and
-stacking both would make a noisy room deaf to real interruptions.
+### Deciding you are interrupting
 
-For the first `BARGE_GRACE_MS` of each sentence nothing can trigger a barge-in,
-because the echo floor has not caught up with the new audio yet.
+Interrupting is judged on **elapsed time**, not on a run of loud frames.
 
-Interrupting then needs `BARGE_START_MS` of sustained speech on top of that --
-a full second, against 140 ms for starting an ordinary turn. Cutting the
-assistant off by accident is far more irritating than taking a moment to be
-sure, so the two are tuned very differently. The assistant keeps talking
-through that second and stops the instant it is up.
+That distinction is the whole thing. Because the bar only drops in the gaps
+between the assistant's own words, speech over a reply is detected in bursts —
+heard for a moment, masked for a moment, repeatedly. Demanding an unbroken run
+of loud frames on top of that is unsatisfiable by ordinary talking however long
+it goes on. In testing, only shouting a single continuous vowel ever managed
+it, which is exactly what you would predict: one long note is the only thing
+that stays above the bar without interruption.
 
-`tests/test_langpal.py::BargeInThresholds` parses these constants out of
-`app.js` and checks, across five speaker and headphone scenarios, that the
-assistant never clears its own bar and that a person always does.
+So the first frame that clears the bar opens a window, later ones extend it,
+and it lapses after `BARGE_HOLD_MS` of nothing at all. Interrupting means "you
+have been talking for `BARGE_START_MS`", gaps included. Simulated against a
+realistic 180 ms-heard / 320 ms-masked burst pattern, the old rule never fires
+and this one fires at 1.01 s.
+
+`BARGE_HOLD_MS` has to be longer than the assistant's own words can mask you,
+or the window keeps resetting; it must stay shorter than `BARGE_START_MS`, or
+evidence outlives the decision it feeds.
+
+When the window completes, the reply **stops** — playback, the queue, and the
+synthesis already running. It is not turned down. An earlier version ducked the
+volume as an intermediate step; that existed only to make the loudness run
+achievable, and it is unnecessary once the window replaces it.
+
+### Seeing what it is doing
+
+Settings has a live readout under **Listening**, active while that panel is
+open:
+
+```
+level 34.1  |  bar 12.0  |  room 3.1  |  echo 2.4  |  HEARD  |  speaking  |  talking 0.4/1.0s
+```
+
+Talk over a reply and watch it. `HEARD` flickering on and off is normal and
+expected — that is the burst detection described above, and `talking` should
+keep climbing through it. If `talking` keeps resetting to 0.0, `BARGE_HOLD_MS`
+is too short for your setup. If `level` never passes `bar` at all, raise Mic
+sensitivity. If `level` barely moves while the assistant speaks, the browser's
+echo canceller is suppressing your voice — use headphones, or turn off *Let me
+interrupt while it is speaking* for half-duplex.
 
 ## Default voices
 

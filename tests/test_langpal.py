@@ -621,11 +621,10 @@ class BargeInThresholds(unittest.TestCase):
     away from what actually ships.
     """
 
-    # The echo column is the *envelope average* of our own output as the
-    # microphone hears it, which is what vad.echoFloor settles on. It is not
-    # the peak: an earlier version of this table held peak values, matching a
-    # peak-hold floor, and the resulting bar was roughly five times the average
-    # echo -- unreachable for anyone talking through a speaker.
+    # The echo column is the *predicted* echo: the level of the buffer being
+    # played, scaled by the learned room coupling. It is no longer measured
+    # from the microphone at all, which is what makes the pauses usable -- in
+    # one, this column goes to zero and the bar drops to ordinary listening.
     #
     #                            room   echo_avg  voice
     SCENARIOS = (
@@ -648,7 +647,7 @@ class BargeInThresholds(unittest.TestCase):
         cls.source = source
         cls.const = {}
         for name in ("NOISE_FLOOR_MULT", "MIN_RMS", "BARGE_MULT", "ECHO_MULT",
-                     "ECHO_RISE", "ECHO_FALL"):
+                     "ECHO_GAIN_RISE", "ECHO_GAIN_FALL"):
             match = re.search(r"const %s = ([0-9.]+);" % name, source)
             assert match, "%s is missing from app.js" % name
             cls.const[name] = float(match.group(1))
@@ -705,14 +704,36 @@ class BargeInThresholds(unittest.TestCase):
         loud = self.threshold(0.003, 0.080)
         self.assertGreater(loud, quiet * 3)
 
-    def test_envelope_follower_rises_faster_than_it_falls(self):
-        """Rise fast to track a sentence; fall slowly to survive its pauses.
+    def test_coupling_learner_rises_faster_than_it_falls(self):
+        """Adapt quickly to a louder room, let go of it slowly."""
+        self.assertGreater(self.const["ECHO_GAIN_RISE"], self.const["ECHO_GAIN_FALL"])
+        self.assertLess(self.const["ECHO_GAIN_RISE"], 1.0)
 
-        Symmetric rates would let the floor collapse between words, so the next
-        syllable would look like someone talking.
+    def test_evidence_outlives_the_assistants_syllables(self):
+        """The hold has to bridge the masked stretches between detections.
+
+        If it lapsed faster than the assistant's own words mask the user, the
+        window would keep resetting and the second could never elapse.
         """
-        self.assertGreater(self.const["ECHO_RISE"], self.const["ECHO_FALL"] * 5)
-        self.assertLess(self.const["ECHO_RISE"], 1.0)
+        import re
+        hold = float(re.search(r"const BARGE_HOLD_MS = ([0-9.]+);",
+                               self.source).group(1))
+        self.assertGreaterEqual(hold, 300)
+        self.assertLess(hold, float(re.search(r"const BARGE_START_MS = ([0-9.]+);",
+                                              self.source).group(1)))
+
+    def test_a_pause_in_playback_drops_the_bar_to_normal(self):
+        """Why this scheme works where measuring the microphone did not.
+
+        Between words the predicted echo is zero, so the threshold falls back
+        to ordinary listening and speech is unmistakable. Someone talking over
+        a reply reaches such a gap within a few hundred milliseconds.
+        """
+        room = 0.003
+        speaking = self.threshold(room, 0.060)
+        in_a_pause = self.threshold(room, 0.0)
+        self.assertLess(in_a_pause, speaking)
+        self.assertLess(in_a_pause, 0.05)
 
     def test_echo_peaks_cannot_sustain_a_false_interruption(self):
         """Peaks above the bar are fine; sustaining them for a second is not.
@@ -885,6 +906,37 @@ class ClientInvariants(unittest.TestCase):
                       "the echo floor must only learn from quiet frames, "
                       "except while bootstrapping at the start of a sentence")
 
+    def test_interrupting_is_judged_on_elapsed_time(self):
+        """The bug that meant only shouting could interrupt.
+
+        Because the bar only drops in the gaps between the assistant's own
+        words, speech is detected in bursts. Requiring an unbroken run of loud
+        frames on top of that is unsatisfiable by ordinary talking however long
+        it goes on -- in testing only a single continuous shouted vowel ever
+        managed it. Elapsed time since the first frame that cleared the bar is
+        the right measure; gaps are expected.
+        """
+        self.assertIn("now - vad.speechSince >= BARGE_START_MS", self.source,
+                      "interrupting must be timed, not accumulated")
+        self.assertIn("vad.lastLoudAt", self.source,
+                      "evidence must lapse when the user actually stops")
+
+    def test_playback_is_stopped_not_merely_quietened(self):
+        """An interruption ends the reply; it does not turn it down."""
+        self.assertNotIn("setDuck", self.source)
+        self.assertNotIn("DUCK_GAIN", self.source)
+
+    def test_echo_is_predicted_from_the_buffer_not_the_microphone(self):
+        """Measuring the microphone cannot separate our voice from theirs.
+
+        It also fails outright when the browser's echo canceller attenuates the
+        microphone during playback: no threshold recovers a signal that is not
+        there.
+        """
+        self.assertIn("function playbackLevel()", self.source)
+        self.assertIn("tts.channel = decoded.getChannelData(0)", self.source,
+                      "the playing buffer must be readable for echo prediction")
+
     def test_the_room_floor_ignores_our_own_playback(self):
         """The bug that kept barge-in from ever firing.
 
@@ -907,7 +959,7 @@ class ClientInvariants(unittest.TestCase):
         refuses to fire. BargeInThresholds cannot catch this: it mirrors the
         formula rather than reading it, so only the source shows the truth.
         """
-        self.assertIn("vad.echoFloor * ECHO_MULT * sensMul", self.source,
+        self.assertIn("expectedEcho() * ECHO_MULT * sensMul", self.source,
                       "mic sensitivity must scale the echo term too")
 
     def test_reply_in_progress_and_audible_are_distinct(self):

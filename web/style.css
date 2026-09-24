@@ -290,6 +290,18 @@ label.check {
 .hint { margin: 6px 0; font-size: 13px; color: var(--muted); }
 .hint code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; }
 
+/* Monospaced and fixed-height so the numbers do not jitter the layout
+   as they update ten times a second. */
+.readout {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  background: var(--surface-2);
+  padding: 8px 10px;
+  border-radius: 8px;
+  white-space: nowrap;
+  overflow-x: auto;
+}
+
 .error { color: var(--danger); font-size: 14px; min-height: 20px; }
 
 details { margin: 12px 0; }
