@@ -111,8 +111,9 @@ Constants at the top of `web/app.js`:
 | Constant | Default | Effect |
 | --- | --- | --- |
 | `SPEECH_START_MS` | 140 | Sustained speech before a turn opens. Raise if noises trigger it. |
-| `BARGE_START_MS` | 320 | Same, while the assistant is speaking. |
+| `BARGE_START_MS` | 1000 | Sustained speech needed to interrupt the assistant. |
 | `PREROLL_MS` | 320 | Audio kept from before speech began. Raise if first words are clipped. |
+| `PREROLL_CAP_MS` | derived | `max(PREROLL_MS, BARGE_START_MS) + 250`. Never hard-code it: the ring must outlast whichever start window is longer. |
 | `MIN_UTTERANCE_MS` | 350 | Below this, discarded as a cough. |
 | `NOISE_FLOOR_MULT` | 3.2 | How far speech must beat the room. |
 | `MIN_RMS` | 0.012 | Absolute floor for very quiet rooms. |

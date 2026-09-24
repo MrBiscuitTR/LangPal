@@ -645,16 +645,44 @@ class BargeInThresholds(unittest.TestCase):
         loud = self.threshold(0.003, 0.160)
         self.assertGreater(loud, quiet * 3)
 
-    def test_grace_window_is_long_enough_to_converge(self):
-        """ECHO_DECAY only matters between sentences; the grace covers onset."""
+    def _timing(self, name):
         import re
         source = io.open(os.path.join(langpal.WEB_DIR, "app.js"),
                          encoding="utf-8").read()
-        grace = float(re.search(r"const BARGE_GRACE_MS = ([0-9.]+);", source).group(1))
-        start = float(re.search(r"const BARGE_START_MS = ([0-9.]+);", source).group(1))
-        # A peak-held floor converges on the first loud frame, but the window
-        # must still outlast the run of frames that would open a turn.
-        self.assertGreater(grace, start * 0.5)
+        return float(re.search(r"const %s = ([0-9.]+);" % name, source).group(1))
+
+    def test_interrupting_is_stricter_than_starting_a_turn(self):
+        """A false interruption costs more than a slow one, so the bar is higher."""
+        self.assertGreater(self._timing("BARGE_START_MS"),
+                           self._timing("SPEECH_START_MS") * 4)
+
+    def test_preroll_covers_the_confirmation_window(self):
+        """The regression this guards against truncates every interruption.
+
+        beginUtterance() seeds the recording from the pre-roll ring. If the
+        ring is shorter than the time taken to decide speech was speech, the
+        opening words are already gone -- and nothing crashes, the transcript
+        just quietly starts mid-sentence.
+        """
+        import re
+        source = io.open(os.path.join(langpal.WEB_DIR, "app.js"),
+                         encoding="utf-8").read()
+        # Derived in the source, so check the expression, not a literal.
+        self.assertRegex(
+            source,
+            r"PREROLL_CAP_MS = Math\.max\(PREROLL_MS, BARGE_START_MS\) \+ \d+")
+        # assertTrue, not assertIn: a failed assertIn would print the whole
+        # 40 kB of app.js as the "not found in" haystack.
+        self.assertTrue(
+            "msToSamples(PREROLL_CAP_MS, rate)" in source,
+            "the pre-roll ring must be trimmed to PREROLL_CAP_MS, not PREROLL_MS, "
+            "or an interruption loses its opening words")
+
+    def test_interruption_stays_responsive(self):
+        """Grace plus confirmation is what the user actually waits through."""
+        total = self._timing("BARGE_GRACE_MS") + self._timing("BARGE_START_MS")
+        self.assertGreaterEqual(self._timing("BARGE_GRACE_MS"), 100)
+        self.assertLessEqual(total, 2000)
 
 class ConfigExposure(unittest.TestCase):
     def test_no_secret_leaks_into_the_client_payload(self):

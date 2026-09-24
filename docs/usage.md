@@ -33,6 +33,13 @@ you hear the first sentence while the rest is still being generated.
 
 Talk over the reply and it stops. That is on by default.
 
+It takes about a second of continuous speech, not a syllable: a false
+interruption is worse than a slightly slow one. The assistant carries on
+talking through that second, then stops immediately -- playback, the sentences
+queued behind it, and the synthesis already running on the GPU. What you said
+during that second is kept, so your interruption is transcribed in full, and
+the conversation carries straight on from it.
+
 LangPal measures how loud its own voice comes back through your microphone and
 raises the bar to match, so playing through speakers does not make it cut
 itself off. It also ignores the first half-second of each sentence, while that

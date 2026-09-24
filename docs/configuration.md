@@ -161,9 +161,14 @@ Stored in `localStorage`, never sent to the server.
 | Send automatically | on | off = the turn is captured but not sent |
 
 Fixed tuning constants live at the top of `web/app.js`: `SPEECH_START_MS`
-(140), `BARGE_START_MS` (420), `PREROLL_MS` (320), `MIN_UTTERANCE_MS` (350),
+(140), `BARGE_START_MS` (1000), `PREROLL_MS` (320), `MIN_UTTERANCE_MS` (350),
 `MAX_UTTERANCE_MS` (60000), `NOISE_FLOOR_MULT` (3.2), `BARGE_MULT` (1.6),
-`ECHO_MULT` (1.5), `ECHO_DECAY` (0.995), `BARGE_GRACE_MS` (600).
+`ECHO_MULT` (1.5), `ECHO_DECAY` (0.995), `BARGE_GRACE_MS` (300).
+
+`PREROLL_CAP_MS` is derived, not set: `max(PREROLL_MS, BARGE_START_MS) + 250`.
+The pre-roll ring has to reach back to the moment speech might have started,
+which is the longer of the two start windows. Hard-coding it would mean raising
+`BARGE_START_MS` silently truncated every interruption.
 
 ### How the assistant avoids interrupting itself
 
@@ -187,6 +192,12 @@ stacking both would make a noisy room deaf to real interruptions.
 
 For the first `BARGE_GRACE_MS` of each sentence nothing can trigger a barge-in,
 because the echo floor has not caught up with the new audio yet.
+
+Interrupting then needs `BARGE_START_MS` of sustained speech on top of that --
+a full second, against 140 ms for starting an ordinary turn. Cutting the
+assistant off by accident is far more irritating than taking a moment to be
+sure, so the two are tuned very differently. The assistant keeps talking
+through that second and stops the instant it is up.
 
 `tests/test_langpal.py::BargeInThresholds` parses these constants out of
 `app.js` and checks, across five speaker and headphone scenarios, that the

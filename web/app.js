@@ -22,9 +22,18 @@ const TARGET_RATE = 16000;        // what we send to the ASR model
 const VOICE_SAMPLE_RATE = 24000;  // reference clips: match OmniVoice's own rate
 
 const SPEECH_START_MS = 140;      // sustained speech before a turn opens
-const BARGE_START_MS = 420;       // longer while the assistant is talking
+// Interrupting takes a full second of sustained speech. It is deliberately
+// far stricter than SPEECH_START_MS: cutting the assistant off by mistake is
+// much more annoying than taking a moment to be sure. The assistant keeps
+// talking during this window, then stops at once when the second is up.
+const BARGE_START_MS = 1000;      // sustained speech needed to interrupt
 const MAX_UTTERANCE_MS = 60000;   // hard stop, below the server's 90 s limit
 const PREROLL_MS = 320;           // audio kept from just before speech began
+// The ring has to hold everything back to the moment speech might have
+// started, which is the longest of the two start windows -- otherwise the
+// opening words of an interruption are gone by the time it is confirmed.
+// Derived rather than hard-coded so it cannot fall behind BARGE_START_MS.
+const PREROLL_CAP_MS = Math.max(PREROLL_MS, BARGE_START_MS) + 250;
 const MIN_UTTERANCE_MS = 350;     // shorter than this is a cough, not a turn
 
 const NOISE_FLOOR_MULT = 3.2;     // speech must beat the room by this much
@@ -43,8 +52,10 @@ const FLOOR_ATTACK = 0.02;        // how fast the noise floor tracks the room
 const ECHO_DECAY = 0.995;         // per frame; roughly halves over a second
 const ECHO_MULT = 1.5;            // speech must beat the echo by this much;
                                   // safe to keep low because the floor is peak-held
-const BARGE_GRACE_MS = 600;       // deaf at the start of a sentence, while
-                                  // the echo floor is still converging
+const BARGE_GRACE_MS = 300;       // deaf at the start of a sentence, while
+                                  // the echo floor is still converging. Short
+                                  // because the floor is peak-held and so
+                                  // settles on the first loud frame.
 
 const LEVEL_DECAY = 0.82;         // smoothing for the on-screen level bar
 
@@ -106,6 +117,7 @@ const vad = {
   echoFloor: 0,           // how loud our own playback returns through the mic
   chunks: [],
   totalSamples: 0,
+  seededSamples: 0,       // how much of chunks came from the pre-roll, not speech
   preroll: [],
   prerollSamples: 0,
   loudSamples: 0,         // consecutive loud samples while idle
@@ -381,6 +393,7 @@ function resetVad() {
   vad.mode = 'idle';
   vad.chunks = [];
   vad.totalSamples = 0;
+  vad.seededSamples = 0;
   vad.preroll = [];
   vad.prerollSamples = 0;
   vad.loudSamples = 0;
@@ -422,7 +435,7 @@ function onFrame(frame) {
 
     vad.preroll.push(samples);
     vad.prerollSamples += samples.length;
-    const prerollCap = msToSamples(PREROLL_MS, rate);
+    const prerollCap = msToSamples(PREROLL_CAP_MS, rate);
     while (vad.prerollSamples > prerollCap && vad.preroll.length > 1) {
       vad.prerollSamples -= vad.preroll.shift().length;
     }
@@ -461,6 +474,9 @@ function beginUtterance() {
   vad.mode = 'speech';
   vad.chunks = vad.preroll.slice();      // keep the word that opened the turn
   vad.totalSamples = vad.prerollSamples;
+  // Remember how much of this is lead-in, so the short-utterance filter below
+  // measures speech rather than the pre-roll, which is now over a second long.
+  vad.seededSamples = vad.prerollSamples;
   vad.preroll = [];
   vad.prerollSamples = 0;
   vad.loudSamples = 0;
@@ -473,9 +489,13 @@ function beginUtterance() {
 function endUtterance() {
   const samples = concatChunks(vad.chunks, vad.totalSamples);
   const rate = audio.rate;
+  // Length of the speech itself, excluding the pre-roll lead-in. Measuring the
+  // whole clip would make this test meaningless, since the pre-roll alone is
+  // longer than MIN_UTTERANCE_MS.
+  const spokenSamples = vad.totalSamples - vad.seededSamples;
   resetVad();
 
-  const ms = (samples.length / rate) * 1000;
+  const ms = (spokenSamples / rate) * 1000;
   if (ms < MIN_UTTERANCE_MS) {
     setStatus(state.listening ? 'ready' : 'idle');
     return;

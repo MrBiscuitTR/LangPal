@@ -77,7 +77,9 @@ thread. Anything heavier there causes audible glitches.
 - **idle** — the noise floor tracks the room with an exponential moving average,
   updated *only on quiet frames* so a long sentence cannot drag the floor up
   and deafen the detector mid-conversation. Recent audio goes into a ring
-  buffer capped at `PREROLL_MS`.
+  buffer capped at `PREROLL_CAP_MS` -- long enough to reach back past the
+  longest start window, so a confirmed interruption still has its opening
+  words.
 - A frame is "loud" when `rms > max(floor × 3.2, 0.012) × sensitivity`. While
   the assistant is speaking that threshold is multiplied by `BARGE_MULT` so the
   reply leaking through the speaker cannot open a turn by itself.
