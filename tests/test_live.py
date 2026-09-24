@@ -157,25 +157,47 @@ class LiveStack(unittest.TestCase):
         with wave.open(io.BytesIO(audio), "rb") as wav:
             self.assertGreater(wav.getnframes() / wav.getframerate(), 0.2)
 
-    def test_stop_cancels_a_stale_epoch(self):
-        # A fresh cookie-less request creates a session at epoch 0, so bumping
-        # it and then presenting epoch 0 has to be refused.
+    def test_stop_cancels_the_turn_it_names(self):
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+        turn = "livetest" + os.urandom(8).hex()
+
         request = urllib.request.Request(
-            self.base + "/api/stop", data=b"{}",
+            self.base + "/api/stop",
+            data=json.dumps({"turn": turn}).encode(),
             headers={"Content-Type": "application/json"})
         with opener.open(request, timeout=30) as resp:
-            epoch = json.loads(resp.read())["epoch"]
-        self.assertGreaterEqual(epoch, 1)
+            self.assertTrue(json.loads(resp.read())["ok"])
 
-        stale = urllib.request.Request(
+        revoked = urllib.request.Request(
             self.base + "/api/tts",
             data=json.dumps({"text": "this must not be synthesised",
-                             "epoch": epoch - 1, "settings": {}}).encode(),
+                             "turn": turn, "settings": {}}).encode(),
             headers={"Content-Type": "application/json"})
         with self.assertRaises(urllib.error.HTTPError) as caught:
-            opener.open(stale, timeout=60)
+            opener.open(revoked, timeout=60)
         self.assertEqual(caught.exception.code, 409)
+
+    def test_an_unknown_turn_is_never_refused(self):
+        """The failure direction that matters.
+
+        A turn id the server cannot place is new work, not stale work. The
+        epoch counter this replaced got it the other way round, so one lost
+        response or a page reload wedged the conversation until restart.
+        """
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+        request = urllib.request.Request(
+            self.base + "/api/stop", data=json.dumps({"turn": "a" * 16}).encode(),
+            headers={"Content-Type": "application/json"})
+        opener.open(request, timeout=30).read()
+
+        fresh = urllib.request.Request(
+            self.base + "/api/tts",
+            data=json.dumps({"text": "a brand new turn must go through",
+                             "turn": "livetest" + os.urandom(8).hex(),
+                             "settings": {}}).encode(),
+            headers={"Content-Type": "application/json"})
+        with opener.open(fresh, timeout=600) as resp:
+            self.assertEqual(resp.headers.get("Content-Type"), "audio/wav")
 
     def test_voice_listing_works(self):
         _ctype, body = self.post("/api/voices", {"settings": {}}, timeout=120)

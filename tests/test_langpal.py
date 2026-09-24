@@ -767,6 +767,53 @@ class BargeInThresholds(unittest.TestCase):
         self.assertGreaterEqual(self._timing("BARGE_GRACE_MS"), 100)
         self.assertLessEqual(total, 2000)
 
+class TurnCancellation(unittest.TestCase):
+    """Turn ids must fail open. The epoch counter they replaced failed closed."""
+
+    def setUp(self):
+        self.session = langpal.Session("sid")
+
+    def test_an_unknown_turn_is_not_cancelled(self):
+        """The whole point.
+
+        A counter shared between browser and server drifts the first time a
+        reload or a dropped response desynchronises it, and every turn after
+        that is rejected as stale -- permanently, until the server restarts.
+        An id the server has never seen must simply be allowed through.
+        """
+        self.assertFalse(self.session.is_cancelled("neverseenbefore1"))
+        self.assertFalse(self.session.is_cancelled(""))
+
+    def test_a_cancelled_turn_stays_cancelled(self):
+        self.session.cancel("abcdef0123456789")
+        self.assertTrue(self.session.is_cancelled("abcdef0123456789"))
+        self.assertFalse(self.session.is_cancelled("0123456789abcdef"))
+
+    def test_cancelling_twice_is_harmless(self):
+        self.session.cancel("abcdef0123456789")
+        self.session.cancel("abcdef0123456789")
+        self.assertEqual(self.session.cancelled.count("abcdef0123456789"), 1)
+
+    def test_the_list_stays_bounded(self):
+        for i in range(langpal.CANCELLED_TURNS * 4):
+            self.session.cancel("turn%012d" % i)
+        self.assertLessEqual(len(self.session.cancelled), langpal.CANCELLED_TURNS)
+        # The most recent survive, which are the ones still worth checking.
+        self.assertTrue(self.session.is_cancelled(
+            "turn%012d" % (langpal.CANCELLED_TURNS * 4 - 1)))
+
+    def test_turn_ids_are_validated(self):
+        handler = langpal.Handler.__new__(langpal.Handler)
+        self.assertEqual(handler._turn_id({}), "")
+        self.assertEqual(handler._turn_id({"turn": None}), "")
+        self.assertEqual(handler._turn_id({"turn": "abcdef0123456789"}),
+                         "abcdef0123456789")
+        for bad in ("short", "../../etc", "a b c d e f g", "x" * 65, 12345, []):
+            with self.subTest(bad=bad):
+                with self.assertRaises(langpal.BadRequest):
+                    handler._turn_id({"turn": bad})
+
+
 class ConnectionErrorHandling(unittest.TestCase):
     """A client that hangs up must not produce a traceback."""
 
@@ -837,6 +884,19 @@ class ClientInvariants(unittest.TestCase):
         self.assertIn("bootstrapping || !loud", self.source,
                       "the echo floor must only learn from quiet frames, "
                       "except while bootstrapping at the start of a sentence")
+
+    def test_the_room_floor_ignores_our_own_playback(self):
+        """The bug that kept barge-in from ever firing.
+
+        vad.floor skips loud frames, but once the echo floor raises the bar the
+        echo registers as quiet -- so it was learnt as room noise. Within about
+        half a second vad.floor reached the echo level, and
+        base * BARGE_MULT (3.2 x 1.6 = 5.1x echo) swamped the echo term that is
+        supposed to govern interruption. Measured: a 0.120 voice against a
+        0.205 bar where it should have been 0.080.
+        """
+        self.assertIn("if (!loud && !audioAudible()) {", self.source,
+                      "the room noise floor must not learn from our own output")
 
     def test_sensitivity_applies_to_the_echo_term(self):
         """Regression: sensMul used to scale only the room-noise term.

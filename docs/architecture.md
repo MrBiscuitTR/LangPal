@@ -40,7 +40,7 @@ roughly 0.27× real time on the reference stack, so the next sentence is always
 ready before the current one finishes playing. A single streaming audio
 response would have been marginally faster to first sound and much harder to
 cancel cleanly — with discrete requests, stopping is just `AbortController`
-plus an epoch bump.
+plus revoking the turn.
 
 **Synthesis starts when a sentence arrives, not when it is due to play.** This
 is the difference between a seamless reply and an audible stall. An earlier
@@ -149,11 +149,17 @@ Two mechanisms, because one is not enough.
 **Client side** — `stopEverything()` drops the queue, stops the playing
 `AudioBufferSourceNode`, and aborts every in-flight `fetch`.
 
-**Server side** — each session has an integer `epoch`. `/api/stop` increments
-it. Every request carries the epoch the client believes is current, and
-`/api/tts` checks it *before* starting synthesis and again after. A request
-that was already queued upstream when you pressed Stop is therefore dropped
-without occupying the GPU.
+**Server side** — the browser mints a random id per reply and sends it with
+every request for that reply. `/api/stop` revokes it, and `/api/tts` checks it
+*before* starting synthesis and again after. A request already queued upstream
+when you pressed Stop is therefore dropped without occupying the GPU.
+
+An id the server has never seen is deliberately **not** revoked. This began as
+a counter incremented on `/api/stop` and echoed back for the client to adopt,
+which fails closed: a page reload reset the browser's copy to zero while the
+session cookie kept the server's, and from then on every turn was rejected as
+stale until the server restarted. A revocation list only ever rejects work it
+was explicitly told about, so nothing can silently wedge.
 
 Aborting the `fetch` alone would not do this: the server would happily finish
 synthesising into a closed socket, holding a `--parallel 1` backend hostage for
@@ -166,7 +172,8 @@ server-generated id in an `HttpOnly`, `SameSite=Strict` cookie. Clients cannot
 choose their own id — an unrecognised one gets a fresh session rather than
 being trusted.
 
-Each holds the conversation history, a lock, and the epoch. The store is capped
+Each holds the conversation history, a lock, and its revoked turn ids (the
+most recent `CANCELLED_TURNS`). The store is capped
 at `MAX_SESSIONS` with least-recently-used eviction. Everything is in RAM and
 dies with the process.
 

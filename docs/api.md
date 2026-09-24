@@ -23,9 +23,15 @@ fields in [configuration.md](configuration.md). Every field is validated and
 clamped server-side; unknown keys are ignored so an old browser tab keeps
 working. Omit it entirely to use the server defaults.
 
-**Epochs.** `/api/chat` and `/api/tts` accept `epoch`. If it does not match the
-session's current epoch the request is refused with `409`. Omit it to mean
-"whatever is current".
+**Turn ids.** `/api/chat` and `/api/tts` accept `turn`, a
+`[A-Za-z0-9_-]{8,64}` id the browser mints per reply. `/api/stop` revokes one;
+work carrying a revoked id is refused with `409`. Omit it and the work simply
+cannot be cancelled.
+
+An id the server has never seen is **not** revoked. That direction is the whole
+design: this replaced a counter both sides had to agree on, and a page reload
+or one lost response desynchronised it permanently, rejecting every turn
+thereafter until the server was restarted.
 
 **Errors.** `{"error": "..."}` with:
 
@@ -34,7 +40,7 @@ session's current epoch the request is refused with `409`. Omit it to mean
 | 400 | Invalid input. The message says which field. |
 | 401 | Password required or wrong. |
 | 404 | No such route. |
-| 409 | Stopped — the epoch is stale. |
+| 409 | Stopped — this turn has been revoked. |
 | 413 | Body over 12 MiB. The connection closes. |
 | 502 | An upstream failed. The message includes a truncated excerpt. |
 | 500 | A bug. Details go to the server log, not to you. |
@@ -128,7 +134,7 @@ is the untouched upstream string, for debugging.
 ## `POST /api/chat`
 
 ```json
-{ "text": "Merhaba, nasılsın?", "epoch": 3, "settings": { "temperature": 0.7 } }
+{ "text": "Merhaba, nasılsın?", "turn": "9f3c…", "settings": { "temperature": 0.7 } }
 ```
 
 Returns `text/event-stream`. The turn is appended to the session history once
@@ -165,7 +171,7 @@ data: {"text": "Merhaba! İyiyim, …", "sentences": 2}
 {
   "text": "Merhaba, nasılsın?",
   "detected_language": "Turkish",
-  "epoch": 3,
+  "turn": "9f3c…",
   "settings": { "voice": "tr_ayse" }
 }
 ```
@@ -178,7 +184,7 @@ speakable in it is a `400`.
 Resolution order: `tts_language` override → pinned `language` →
 `detected_language` → `English`.
 
-The epoch is checked before synthesis starts and again after it returns, so
+The turn is checked before synthesis starts and again after it returns, so
 pressing Stop discards queued work instead of paying for it.
 
 ---
@@ -186,15 +192,16 @@ pressing Stop discards queued work instead of paying for it.
 ## `POST /api/stop`
 
 ```json
-{ "epoch": 4 }
+{ "turn": "9f3c…" }
 ```
 
-Increments the session epoch, invalidating everything in flight. Returns the
-new value, which the client should adopt.
+Revokes that turn, so anything still queued for it is dropped. Returns
+`{"ok": true}`. The client does not need to track anything.
 
 ## `POST /api/reset`
 
-Clears the session's history and bumps the epoch. `{"ok": true, "epoch": 5}`.
+Clears the session's history, and revokes `turn` if one is given.
+`{"ok": true}`.
 
 ---
 

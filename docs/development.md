@@ -63,7 +63,7 @@ python -m unittest tests.test_live -v
 
 Skipped unless `LANGPAL_LIVE=1`. They start a server on a spare port and drive
 a real turn through it: health, transcription, streaming chat, synthesis, and
-that a stale epoch is refused with 409. They register no voices and write
+that a revoked turn is refused with 409. They register no voices and write
 nothing, so your voice registry is untouched. A cold run takes a minute or two
 while models load.
 

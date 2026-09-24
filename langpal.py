@@ -358,6 +358,13 @@ MAX_URL_CHARS = 512
 MAX_SSE_LINE_BYTES = 256 * 1024          # one upstream SSE line
 MAX_ERROR_ECHO_CHARS = 400               # how much upstream error text we relay
 
+# Cancelled turn ids remembered per session. Only needs to outlast requests
+# already queued upstream when Stop was pressed, which is a handful.
+CANCELLED_TURNS = 32
+
+# A turn id is minted by the browser, one per reply.
+TURN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
 # Concurrent sessions kept in RAM; the least recently used is dropped past this.
 MAX_SESSIONS = 32
 
@@ -1315,9 +1322,27 @@ class Session:
     def __init__(self, sid: str):
         self.sid = sid
         self.history = []          # [{"role": "user"|"assistant", "content": str}]
-        self.epoch = 0             # bumped by /api/stop to cancel in-flight work
+        self.cancelled = []        # turn ids Stop has revoked, newest last
         self.last_seen = time.monotonic()
         self.lock = threading.Lock()
+
+    def cancel(self, turn: str) -> None:
+        """Revoke a turn, so work still queued for it is dropped."""
+        with self.lock:
+            if turn in self.cancelled:
+                return
+            self.cancelled.append(turn)
+            if len(self.cancelled) > CANCELLED_TURNS:
+                del self.cancelled[:-CANCELLED_TURNS]
+
+    def is_cancelled(self, turn: str) -> bool:
+        """Whether this turn has been revoked.
+
+        An id we have never seen is *not* cancelled. That direction matters:
+        a turn the server cannot place is a new one, and refusing it would
+        wedge the conversation with no way back.
+        """
+        return bool(turn) and turn in self.cancelled
 
 
 class SessionStore:
@@ -1691,7 +1716,7 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         settings = validate_settings(body.get("settings"))
         session, _cookie = self._session()
-        epoch = self._require_epoch(body, session)
+        turn = self._turn_id(body)
 
         text = body.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -1706,39 +1731,45 @@ class Handler(BaseHTTPRequestHandler):
             detected = ""
         language = tts_language_for(settings, detected)
 
-        # Cheap pre-flight check: if stop was pressed while this request sat in
+        # Cheap pre-flight check: if Stop was pressed while this request sat in
         # the queue, skip the synthesis entirely instead of burning the GPU.
-        if session.epoch != epoch:
+        if session.is_cancelled(turn):
             raise Aborted()
         audio = synthesize(text, settings, language)
-        if session.epoch != epoch:
+        if session.is_cancelled(turn):
             raise Aborted()
         return self._send(200, audio, content_type="audio/wav",
                           extra_headers={"Cache-Control": "no-store"})
 
-    def _require_epoch(self, body, session):
-        """Read the client's epoch, defaulting to the session's current one."""
-        epoch = body.get("epoch")
-        if epoch is None:
-            return session.epoch
-        if not isinstance(epoch, int) or isinstance(epoch, bool):
-            raise BadRequest("epoch must be an integer")
-        return epoch
+    def _turn_id(self, body):
+        """Read the optional turn id. Absent means the work is uncancellable."""
+        turn = body.get("turn")
+        if turn is None or turn == "":
+            return ""
+        if not isinstance(turn, str) or not TURN_ID_RE.match(turn):
+            raise BadRequest("turn must be 8-64 characters of letters, digits, _ or -")
+        return turn
 
     def _handle_stop(self):
-        """Cancel everything in flight for this session."""
+        """Revoke a turn, cancelling anything still queued for it."""
+        body = self._read_json()
         session, cookie = self._session()
-        session.epoch += 1
+        turn = self._turn_id(body)
+        if turn:
+            session.cancel(turn)
         extra = {"Set-Cookie": cookie} if cookie else None
-        return self._send_json(200, {"epoch": session.epoch}, extra_headers=extra)
+        return self._send_json(200, {"ok": True}, extra_headers=extra)
 
     def _handle_reset(self):
+        body = self._read_json()
         session, cookie = self._session()
+        turn = self._turn_id(body)
+        if turn:
+            session.cancel(turn)
         with session.lock:
             session.history = []
-        session.epoch += 1
         extra = {"Set-Cookie": cookie} if cookie else None
-        return self._send_json(200, {"ok": True, "epoch": session.epoch}, extra_headers=extra)
+        return self._send_json(200, {"ok": True}, extra_headers=extra)
 
     def _handle_voices_list(self):
         body = self._read_json()
@@ -1798,8 +1829,8 @@ class Handler(BaseHTTPRequestHandler):
             raise BadRequest("text is required")
         text = text.strip()[:MAX_USER_TEXT_CHARS]
 
-        epoch = self._require_epoch(body, session)
-        if session.epoch != epoch:
+        turn = self._turn_id(body)
+        if session.is_cancelled(turn):
             raise Aborted()
 
         with session.lock:
@@ -1839,7 +1870,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             for piece in stream_chat(messages, settings):
-                if session.epoch != epoch:
+                if session.is_cancelled(turn):
                     raise Aborted()
                 shown, in_think = strip_think(piece, in_think)
                 if not shown:

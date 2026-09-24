@@ -103,12 +103,12 @@ const state = {
   config: null,
   settings: {},
   local: Object.assign({}, DEFAULT_LOCAL),
-  epoch: 0,
   listening: false,
   muted: false,
   busy: false,            // a turn is in flight
   stopPending: null,      // promise for an in-progress /api/stop
   chatController: null,
+  turnId: null,           // identifies the reply being produced, for Stop
   aborters: new Set(),    // every in-flight fetch Stop should cancel
   generation: 0,          // bumped by Stop; a turn from an older one is dropped
   detectedLanguage: '',
@@ -184,6 +184,16 @@ function toBase64(bytes) {
 }
 
 const msToSamples = (ms, rate) => Math.round((ms / 1000) * rate);
+
+// Identifies one reply, so Stop can revoke exactly that work on the server.
+// Generated here rather than counted on both sides: a number the browser and
+// the server each track independently drifts apart the first time a reload
+// or a dropped response desynchronises them, and there is no way back.
+function newTurnId() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 /* ---------------------------------------------------------------------------
  * Settings persistence
@@ -471,7 +481,16 @@ function onFrame(frame) {
   if (vad.mode === 'idle') {
     // Track the room's noise floor from quiet frames only, so a long sentence
     // cannot drag the floor up and deafen us mid-conversation.
-    if (!loud) vad.floor = vad.floor * (1 - FLOOR_ATTACK) + rms * FLOOR_ATTACK;
+    //
+    // And never while our own audio is playing. Once the echo floor lifts the
+    // bar, the echo itself registers as "quiet" and would be learnt as room
+    // noise: within about half a second vad.floor reaches the echo level, and
+    // base * BARGE_MULT (3.2 x 1.6 = 5.1x the echo) swamps the echo term that
+    // is supposed to be governing this. That is a second, slower inflation
+    // path to exactly the failure ECHO_MULT was introduced to prevent.
+    if (!loud && !audioAudible()) {
+      vad.floor = vad.floor * (1 - FLOOR_ATTACK) + rms * FLOOR_ATTACK;
+    }
 
     vad.preroll.push(samples);
     vad.prerollSamples += samples.length;
@@ -571,7 +590,7 @@ async function submitAudio(samples, rate, reviewOnly) {
   if (state.busy) return;
   state.busy = true;
   try {
-    if (state.stopPending) await state.stopPending;   // make sure epoch is current
+    if (state.stopPending) await state.stopPending;   // let the stop land first
     setStatus('transcribing…');
 
     const generation = state.generation;
@@ -635,6 +654,8 @@ async function sendTypedText(text) {
 }
 
 async function runChat(text) {
+  const turn = newTurnId();
+  state.turnId = turn;
   const controller = new AbortController();
   state.chatController = controller;
   el('btn-stop').disabled = false;
@@ -649,7 +670,7 @@ async function runChat(text) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         text: text,
-        epoch: state.epoch,
+        turn: turn,
         settings: settingsForRequest(),
       }),
       signal: controller.signal,
@@ -683,7 +704,10 @@ async function runChat(text) {
       }
     });
   } catch (err) {
-    if (err.name !== 'AbortError') {
+    // AbortError is our own Stop. STOPPED_MESSAGE is the server agreeing,
+    // which arrives as a 409 when a revoked turn is rejected outright --
+    // neither is a fault worth putting on screen.
+    if (err.name !== 'AbortError' && String(err.message) !== STOPPED_MESSAGE) {
       note(String(err.message || err), true);
       setStatus(String(err.message || err), 'error');
     }
@@ -741,7 +765,7 @@ async function fetchSentenceAudio(text) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         text: text,
-        epoch: state.epoch,
+        turn: state.turnId,
         detected_language: state.detectedLanguage,
         settings: settingsForRequest(),
       }),
@@ -876,7 +900,7 @@ async function ttsWorker() {
  * ------------------------------------------------------------------------- */
 
 // Halts playback, drops queued sentences, aborts in-flight requests and bumps
-// the server-side epoch so work already queued upstream is discarded too.
+// revoking the turn server-side so work already queued upstream is dropped too.
 function stopEverything() {
   // Any turn already in flight belongs to the previous generation and must
   // not carry on to the model once it comes back.
@@ -906,9 +930,14 @@ function stopEverything() {
   el('btn-stop').disabled = true;
   setStatus(state.listening ? 'ready' : 'idle', state.listening ? 'live' : null);
 
-  state.stopPending = api('/api/stop', {})
-    .then((data) => { state.epoch = data.epoch; })
-    .catch(() => { /* the local stop already happened; epoch stays as it was */ })
+  // Tell the server to revoke this turn, so requests already queued upstream
+  // are dropped rather than synthesised into a socket nobody is reading.
+  // Nothing depends on the reply: the local stop has already happened, and a
+  // turn id the server never hears about simply runs to completion there.
+  const turn = state.turnId;
+  state.turnId = null;
+  state.stopPending = api('/api/stop', turn ? { turn: turn } : {})
+    .catch(() => { /* best effort */ })
     .finally(() => { state.stopPending = null; });
   return state.stopPending;
 }
@@ -1340,9 +1369,11 @@ function wire() {
   });
 
   el('btn-reset').addEventListener('click', async () => {
+    // Stop first: clearing the transcript while a reply is still arriving
+    // would leave it talking into an empty screen.
+    stopEverything();
     try {
-      const data = await api('/api/reset', {});
-      state.epoch = data.epoch;
+      await api('/api/reset', {});
       el('transcript').replaceChildren();
       note('conversation cleared');
     } catch (err) {
