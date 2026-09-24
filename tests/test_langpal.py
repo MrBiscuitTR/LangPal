@@ -296,6 +296,39 @@ class ValidateSettings(unittest.TestCase):
             langpal.validate_settings([1, 2, 3])
 
 
+class LanguageNormalisation(unittest.TestCase):
+    """The models key off the usual written form of the English name."""
+
+    def test_capitalisation_is_fixed(self):
+        for raw, expected in (("french", "French"), ("FRENCH", "French"),
+                              ("French", "French"), ("  turkish  ", "Turkish"),
+                              ("brazilian portuguese", "Brazilian Portuguese")):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    langpal.validate_settings({"language": raw})["language"],
+                    expected)
+
+    def test_auto_is_left_alone(self):
+        for raw in ("auto", "AUTO", "Auto"):
+            self.assertEqual(
+                langpal.validate_settings({"language": raw})["language"], "auto")
+
+    def test_overrides_are_normalised_too(self):
+        settings = langpal.validate_settings(
+            {"stt_language": "german", "tts_language": "SPANISH"})
+        self.assertEqual(settings["stt_language"], "German")
+        self.assertEqual(settings["tts_language"], "Spanish")
+
+    def test_blank_overrides_stay_blank(self):
+        settings = langpal.validate_settings({"stt_language": "", "tts_language": ""})
+        self.assertEqual(settings["stt_language"], "")
+        self.assertEqual(settings["tts_language"], "")
+
+    def test_the_helper_is_idempotent(self):
+        once = langpal.normalize_language_name("brazilian portuguese")
+        self.assertEqual(langpal.normalize_language_name(once), once)
+
+
 class LanguageResolution(unittest.TestCase):
     def test_auto_sends_nothing_to_stt(self):
         settings = langpal.validate_settings({"language": "auto"})
@@ -588,50 +621,67 @@ class BargeInThresholds(unittest.TestCase):
     away from what actually ships.
     """
 
-    #                        room    echo   the user's voice
+    # The echo column is the *envelope average* of our own output as the
+    # microphone hears it, which is what vad.echoFloor settles on. It is not
+    # the peak: an earlier version of this table held peak values, matching a
+    # peak-hold floor, and the resulting bar was roughly five times the average
+    # echo -- unreachable for anyone talking through a speaker.
+    #
+    #                            room   echo_avg  voice
     SCENARIOS = (
-        ("headphones, quiet room",   0.002, 0.003, 0.10),
-        ("laptop speakers, normal",  0.003, 0.040, 0.15),
-        ("speakers loud, poor AEC",  0.004, 0.090, 0.20),
-        ("speakers very loud",       0.004, 0.160, 0.25),
-        ("noisy room, headphones",   0.020, 0.005, 0.15),
+        ("headphones, quiet room",   0.002, 0.002, 0.100),
+        ("laptop speakers, normal",  0.003, 0.020, 0.100),
+        ("speakers loud, poor AEC",  0.004, 0.045, 0.130),
+        ("speakers very loud",       0.004, 0.080, 0.200),
+        ("noisy room, headphones",   0.020, 0.004, 0.150),
     )
+
+    # vad.loudSamples grows by one frame when loud and shrinks by this many
+    # when not, so a run of speech must be loud for D/(1+D) of its frames.
+    LOUD_DECAY = 1.5
 
     @classmethod
     def setUpClass(cls):
         import re
         source = io.open(os.path.join(langpal.WEB_DIR, "app.js"),
                          encoding="utf-8").read()
+        cls.source = source
         cls.const = {}
-        for name in ("NOISE_FLOOR_MULT", "MIN_RMS", "BARGE_MULT", "ECHO_MULT"):
+        for name in ("NOISE_FLOOR_MULT", "MIN_RMS", "BARGE_MULT", "ECHO_MULT",
+                     "ECHO_RISE", "ECHO_FALL"):
             match = re.search(r"const %s = ([0-9.]+);" % name, source)
             assert match, "%s is missing from app.js" % name
             cls.const[name] = float(match.group(1))
 
     def threshold(self, room_rms, echo_rms, sensitivity=5):
-        """Mirrors currentThreshold() in app.js."""
+        """Mirrors currentThreshold() in app.js while audio is audible.
+
+        A mirror, not the real thing: it reads the constants from app.js but
+        restates the formula. It therefore checks that the *policy* is sound,
+        not that the JavaScript implements it. ClientInvariants asserts on the
+        source for the shape of the expression itself.
+        """
         sens_mul = 0.85 ** (sensitivity - 5)
         base = max(room_rms * self.const["NOISE_FLOOR_MULT"],
                    self.const["MIN_RMS"]) * sens_mul
-        # echoFloor is peak-held, so it settles at the echo's peak level.
         return max(base * self.const["BARGE_MULT"],
-                   echo_rms * self.const["ECHO_MULT"])
+                   echo_rms * self.const["ECHO_MULT"] * sens_mul)
 
     def test_the_assistant_never_interrupts_itself(self):
-        for name, room, echo, _user in self.SCENARIOS:
+        for name, room, echo, _voice in self.SCENARIOS:
             with self.subTest(scenario=name):
                 self.assertLess(
                     echo, self.threshold(room, echo),
-                    "%s: echo %.3f clears the bar, so playback cuts itself off"
-                    % (name, echo))
+                    "%s: the echo envelope at %.3f clears the bar, so playback "
+                    "cuts itself off" % (name, echo))
 
     def test_the_user_can_still_interrupt(self):
-        for name, room, echo, user in self.SCENARIOS:
+        for name, room, echo, voice in self.SCENARIOS:
             with self.subTest(scenario=name):
                 self.assertGreater(
-                    user, self.threshold(room, echo),
+                    voice, self.threshold(room, echo),
                     "%s: speech at %.3f cannot be heard over the echo"
-                    % (name, user))
+                    % (name, voice))
 
     def test_raising_sensitivity_lowers_the_bar(self):
         room, echo = 0.003, 0.003
@@ -639,11 +689,44 @@ class BargeInThresholds(unittest.TestCase):
         self.assertGreater(bars[0], bars[1])
         self.assertGreater(bars[1], bars[2])
 
+    def test_sensitivity_reaches_the_echo_term(self):
+        """Regression: it used to scale only the room term.
+
+        That made Mic sensitivity do nothing at all for interrupting, which is
+        precisely the control someone reaches for when barge-in will not fire.
+        """
+        loud_echo = 0.080          # the echo term dominates at this level
+        self.assertLess(self.threshold(0.003, loud_echo, sensitivity=9),
+                        self.threshold(0.003, loud_echo, sensitivity=5))
+
     def test_echo_floor_dominates_when_playback_is_loud(self):
         """The whole point: a loud speaker must raise the bar, not be ignored."""
-        quiet = self.threshold(0.003, 0.003)
-        loud = self.threshold(0.003, 0.160)
+        quiet = self.threshold(0.003, 0.002)
+        loud = self.threshold(0.003, 0.080)
         self.assertGreater(loud, quiet * 3)
+
+    def test_envelope_follower_rises_faster_than_it_falls(self):
+        """Rise fast to track a sentence; fall slowly to survive its pauses.
+
+        Symmetric rates would let the floor collapse between words, so the next
+        syllable would look like someone talking.
+        """
+        self.assertGreater(self.const["ECHO_RISE"], self.const["ECHO_FALL"] * 5)
+        self.assertLess(self.const["ECHO_RISE"], 1.0)
+
+    def test_echo_peaks_cannot_sustain_a_false_interruption(self):
+        """Peaks above the bar are fine; sustaining them for a second is not.
+
+        Speech peaks run well above its envelope average, so individual
+        syllables of our own output do cross the threshold. Interrupting needs
+        the level held there for BARGE_START_MS, and the accumulator decays
+        faster than it fills, so a run has to be loud for most of its frames.
+        Scattered peaks cannot manage that.
+        """
+        duty_needed = self.LOUD_DECAY / (1.0 + self.LOUD_DECAY)
+        self.assertGreater(duty_needed, 0.5,
+                           "the accumulator must demand a clear majority of "
+                           "loud frames, or noise will trip it")
 
     def _timing(self, name):
         import re
@@ -754,6 +837,29 @@ class ClientInvariants(unittest.TestCase):
         self.assertIn("bootstrapping || !loud", self.source,
                       "the echo floor must only learn from quiet frames, "
                       "except while bootstrapping at the start of a sentence")
+
+    def test_sensitivity_applies_to_the_echo_term(self):
+        """Regression: sensMul used to scale only the room-noise term.
+
+        Interrupting is governed by the echo term whenever the speaker is
+        audible, so leaving sensMul off it meant Mic sensitivity had no effect
+        at all on barge-in -- the one control a user would reach for when it
+        refuses to fire. BargeInThresholds cannot catch this: it mirrors the
+        formula rather than reading it, so only the source shows the truth.
+        """
+        self.assertIn("vad.echoFloor * ECHO_MULT * sensMul", self.source,
+                      "mic sensitivity must scale the echo term too")
+
+    def test_reply_in_progress_and_audible_are_distinct(self):
+        """Synthesis is silent, so it must not drive the echo threshold."""
+        self.assertIn("function replyActive()", self.source)
+        self.assertIn("function audioAudible()", self.source)
+        self.assertIn("if (!audioAudible()) return base;", self.source,
+                      "the threshold must key off audible sound, not a pending reply")
+
+    def test_a_cancelled_turn_is_not_shown_as_an_error(self):
+        self.assertIn("STOPPED_MESSAGE", self.source,
+                      "a stop we asked for must not surface as a red error")
 
     def test_stop_invalidates_an_in_flight_turn(self):
         self.assertIn("state.generation++", self.source)

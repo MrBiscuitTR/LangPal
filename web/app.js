@@ -15,6 +15,11 @@
  * Tuning
  * ------------------------------------------------------------------------- */
 
+// The server reports a turn we cancelled ourselves with this exact message.
+// It is the expected outcome of pressing Stop or interrupting, not a fault,
+// so it is never shown. Anything else from the server is a real error.
+const STOPPED_MESSAGE = 'stopped';
+
 const STORAGE_SETTINGS = 'langpal.settings.v1';   // mirrors the server's schema
 const STORAGE_LOCAL = 'langpal.local.v1';         // browser-only preferences
 
@@ -49,9 +54,17 @@ const FLOOR_ATTACK = 0.02;        // how fast the noise floor tracks the room
 // A separate peak-hold floor tracks how loud our output comes back: it rises
 // instantly and decays slowly, so it stays high through the gaps between
 // sentences instead of collapsing and re-triggering on the next one.
-const ECHO_DECAY = 0.995;         // per frame; roughly halves over a second
-const ECHO_MULT = 1.5;            // speech must beat the echo by this much;
-                                  // safe to keep low because the floor is peak-held
+// Asymmetric envelope follower: rises quickly so a sentence's echo is
+// tracked within a few frames, falls slowly so it does not collapse during
+// the pauses between words and let the next burst look like speech.
+//
+// Deliberately not a peak-hold. Holding the peak latches onto the loudest
+// frame of the sentence, and speech peaks run three to four times its
+// average -- so the bar ended up around five times the average echo, which
+// a person talking through a speaker cannot clear.
+const ECHO_RISE = 0.30;           // per frame, towards a louder measurement
+const ECHO_FALL = 0.02;           // per frame, towards a quieter one
+const ECHO_MULT = 2.0;            // speech must beat the echo envelope by this
 const BARGE_GRACE_MS = 300;       // deaf at the start of a sentence, while
                                   // the echo floor is still converging. Short
                                   // because the floor is peak-held and so
@@ -297,15 +310,29 @@ function currentThreshold() {
   // Higher sensitivity lowers the bar. 0.85^(s-5) maps 1..10 to ~1.9..0.44.
   const sensMul = Math.pow(0.85, (state.local.sensitivity || 5) - 5);
   const base = Math.max(vad.floor * NOISE_FLOOR_MULT, MIN_RMS) * sensMul;
-  if (!isSpeaking()) return base;
-  // While the assistant is speaking, the bar is whichever is higher: the
-  // usual threshold with extra margin, or a margin above the measured echo.
-  // The second term is what adapts to speaker volume and room acoustics.
-  return Math.max(base * BARGE_MULT, vad.echoFloor * ECHO_MULT);
+  if (!audioAudible()) return base;
+  // While sound is playing, the bar is whichever is higher: the usual
+  // threshold with a little extra margin, or a margin above the measured
+  // echo envelope. The second term adapts to speaker volume and the room.
+  //
+  // sensMul applies to both terms. It used to scale only the first, which
+  // made Mic sensitivity do nothing whatsoever for interrupting -- the one
+  // knob a user reaches for when barge-in will not fire.
+  return Math.max(base * BARGE_MULT, vad.echoFloor * ECHO_MULT * sensMul);
 }
 
-function isSpeaking() {
+// Is a reply in progress at all? True from the first sentence being queued
+// until the last has finished playing. Speaking over it should cancel it.
+function replyActive() {
   return tts.running || tts.source !== null;
+}
+
+// Is sound actually coming out of the speaker right now? Only then is there
+// echo to compensate for. These differ for the second or so a sentence
+// spends being synthesised, where treating silence as though it were echo
+// left the threshold keyed to an echo floor of zero.
+function audioAudible() {
+  return tts.source !== null;
 }
 
 // The browser's own wording for a refused microphone -- "not allowed by the
@@ -415,13 +442,13 @@ function onFrame(frame) {
   if (!state.listening || state.muted) return;
 
   // Half-duplex mode: ignore the microphone entirely while the reply plays.
-  if (isSpeaking() && !state.local.bargeIn) return;
+  if (replyActive() && !state.local.bargeIn) return;
 
   // A turn is already being transcribed or answered, so do not queue another.
   // The exception is barge-in over audible speech: beginUtterance() cancels
   // the turn in progress, and refusing here would make it impossible to
   // interrupt while the model is still generating.
-  if (state.busy && vad.mode === 'idle' && !isSpeaking()) return;
+  if (state.busy && vad.mode === 'idle' && !replyActive()) return;
 
   const loud = rms > currentThreshold();
 
@@ -435,9 +462,10 @@ function onFrame(frame) {
   // The exception is the grace window at the start of a sentence, where the
   // floor has nothing to go on yet and every frame has to count to
   // bootstrap it. Peak-hold: jump to any new peak, decay gently otherwise.
-  const bootstrapping = isSpeaking() && Date.now() - tts.startedAt < BARGE_GRACE_MS;
-  if (isSpeaking() && vad.mode === 'idle' && (bootstrapping || !loud)) {
-    vad.echoFloor = Math.max(rms, vad.echoFloor * ECHO_DECAY);
+  const bootstrapping = audioAudible() && Date.now() - tts.startedAt < BARGE_GRACE_MS;
+  if (audioAudible() && vad.mode === 'idle' && (bootstrapping || !loud)) {
+    const rate = rms > vad.echoFloor ? ECHO_RISE : ECHO_FALL;
+    vad.echoFloor += (rms - vad.echoFloor) * rate;
   }
 
   if (vad.mode === 'idle') {
@@ -459,13 +487,17 @@ function onFrame(frame) {
       return;
     }
 
-    const needed = msToSamples(isSpeaking() ? BARGE_START_MS : SPEECH_START_MS, rate);
+    // A reply still being synthesised is silent, but cancelling it is just
+    // as disruptive as cutting off audio, so it takes the same deliberate
+    // second of speech.
+    const needed = msToSamples(replyActive() ? BARGE_START_MS : SPEECH_START_MS, rate);
     // Decay rather than reset, so the brief dips between words inside a
-    // second of speech do not keep restarting the count from zero. Twice as
-    // fast as it builds, so scattered noise still never accumulates.
+    // second of speech do not keep restarting the count from zero. Faster
+    // than it builds, so scattered noise still never accumulates, but not
+    // so fast that speech hovering near the bar can never reach it.
     vad.loudSamples = loud
       ? vad.loudSamples + samples.length
-      : Math.max(0, vad.loudSamples - samples.length * 2);
+      : Math.max(0, vad.loudSamples - samples.length * 1.5);
     if (vad.loudSamples >= needed) beginUtterance();
     return;
   }
@@ -485,7 +517,7 @@ function onFrame(frame) {
 function beginUtterance() {
   // Speaking over the assistant cancels it, which is the whole point of
   // barge-in. Also cancels any queued synthesis on the server.
-  const interrupting = isSpeaking();
+  const interrupting = replyActive();
   if (interrupting) stopEverything();
 
   vad.mode = 'speech';
@@ -642,8 +674,12 @@ async function runChat(text) {
       } else if (event === 'done') {
         if (!bubble.textContent) bubble.remove();
       } else if (event === 'error') {
-        note(data.message, true);
-        setStatus(data.message, 'error');
+        // A stop we asked for normally aborts the fetch before this event
+        // is read, but the two race; when the event wins, do not surface it.
+        if (data.message !== STOPPED_MESSAGE) {
+          note(data.message, true);
+          setStatus(data.message, 'error');
+        }
       }
     });
   } catch (err) {
@@ -759,7 +795,7 @@ function playDecoded(decoded) {
     source.connect(audio.playCtx.destination);
 
     // This promise MUST settle on every path. If it does not, ttsWorker
-    // waits on it forever, tts.running stays true, and isSpeaking() is
+    // waits on it forever, tts.running stays true, and replyActive() is
     // permanently true -- which leaves the microphone stuck in barge-in
     // mode and the app silently deaf. Idempotent, so stopping mid-playback
     // and the natural end cannot both resolve it twice.
@@ -819,7 +855,10 @@ async function ttsWorker() {
       decoded = await job.audio;
     } catch (err) {
       if (err.name === 'AbortError') return;
-      note(String(err.message || err), true);
+      // Same race as above: a sentence cancelled by Stop comes back 409.
+      if (String(err.message) !== STOPPED_MESSAGE) {
+        note(String(err.message || err), true);
+      }
       continue;
     }
 
@@ -1355,7 +1394,7 @@ function wire() {
 
   // Leaving the tab should not leave audio playing into an empty room.
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && isSpeaking()) stopEverything();
+    if (document.hidden && replyActive()) stopEverything();
   });
 }
 

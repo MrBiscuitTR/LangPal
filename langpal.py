@@ -584,6 +584,22 @@ def _opt_bool(raw, field):
     return raw
 
 
+def normalize_language_name(name: str) -> str:
+    """Capitalise a language name the way the models expect.
+
+    Qwen3-ASR and OmniVoice are given the English name, and they key off its
+    usual written form: "French" is recognised where "french" and "FRENCH" are
+    not reliably. Each word is capitalised, so "brazilian portuguese" becomes
+    "Brazilian Portuguese".
+
+    Hyphenated names keep their internal capitalisation as typed, which is the
+    conservative choice -- guessing at "Sino-Tibetan" versus "Sino-tibetan"
+    would be wrong as often as it was right.
+    """
+    return " ".join(word[:1].upper() + word[1:].lower()
+                    for word in name.split() if word)
+
+
 def _language(raw, field, *, allow_auto=False, allow_empty=False):
     raw = (raw or "").strip()
     if not raw:
@@ -593,8 +609,11 @@ def _language(raw, field, *, allow_auto=False, allow_empty=False):
     if allow_auto and raw.lower() == "auto":
         return "auto"
     if not LANGUAGE_RE.match(raw):
-        raise BadRequest("%s must be a language name such as 'Turkish'" % field)
-    return raw
+        raise BadRequest("%s must be a language name in English, such as "
+                         "'English' or 'French'" % field)
+    # Normalised after validation, so the models always receive the form they
+    # recognise however the user typed it.
+    return normalize_language_name(raw)
 
 
 def validate_settings(raw) -> dict:

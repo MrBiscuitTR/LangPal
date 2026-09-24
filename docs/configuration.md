@@ -142,9 +142,16 @@ Overrides, if you want them to differ:
 | `stt_language` | follow `language` |
 | `tts_language` | follow `language` |
 
-Use an English language **name**. Qwen3-ASR ignores ISO codes: `language=tr`
-produced a detected-language of *English* in testing, while `language=Turkish`
-correctly forced Turkish.
+Use an English language **name** — `English`, `French`, `Japanese` — not the
+language's own name for itself and not an ISO code. Qwen3-ASR ignores codes:
+`language=tr` produced a detected-language of *English* in testing, while
+`language=Turkish` correctly forced Turkish.
+
+Capitalisation is normalised server-side, so `french`, `FRENCH` and `French`
+all become `French` before anything is sent upstream; `brazilian portuguese`
+becomes `Brazilian Portuguese`. The models key off the usual written form, so
+this is not cosmetic. The UI offers the common languages as autocomplete
+suggestions, but the field is free text — anything the models support works.
 
 Auto-detect is unreliable on short clips. The same 2.2-second Turkish sample
 came back as *English* on one run and *Arabic* on another. Pin the language.
@@ -163,7 +170,8 @@ Stored in `localStorage`, never sent to the server.
 Fixed tuning constants live at the top of `web/app.js`: `SPEECH_START_MS`
 (140), `BARGE_START_MS` (1000), `PREROLL_MS` (320), `MIN_UTTERANCE_MS` (350),
 `MAX_UTTERANCE_MS` (60000), `NOISE_FLOOR_MULT` (3.2), `BARGE_MULT` (1.6),
-`ECHO_MULT` (1.5), `ECHO_DECAY` (0.995), `BARGE_GRACE_MS` (300).
+`ECHO_MULT` (2.0), `ECHO_RISE` (0.30), `ECHO_FALL` (0.02), `BARGE_GRACE_MS`
+(300).
 
 `PREROLL_CAP_MS` is derived, not set: `max(PREROLL_MS, BARGE_START_MS) + 250`.
 The pre-roll ring has to reach back to the moment speech might have started,
@@ -177,15 +185,36 @@ playback starts. On its own that leaves the bar where a silent room put it,
 which the assistant's own voice through a speaker clears easily -- the reply
 then cuts itself off a word in.
 
-So a second, peak-held **echo floor** tracks how loud our own output comes back
-through the microphone. It jumps to any new peak and decays slowly
-(`ECHO_DECAY`), staying high through the gaps between sentences. The bar while
-speaking is whichever is higher:
+So a second **echo floor** tracks how loud our own output comes back through
+the microphone, as an asymmetric envelope follower: it rises quickly
+(`ECHO_RISE`) so a sentence is tracked within a few frames, and falls slowly
+(`ECHO_FALL`) so it does not collapse in the pauses between words.
+
+It deliberately does *not* hold the peak. An earlier version did, and since
+speech peaks run three to four times its average, the bar landed at roughly
+five times the average echo — which nobody talking through a speaker can
+clear, so barge-in simply never fired.
+
+It also only learns from frames that are *below* the current threshold, the
+same rule the room floor uses. Learning from loud frames means a frame carrying
+the user's voice raises the floor, which raises the bar above them: the harder
+they talk, the further out of reach it gets.
+
+The bar while sound is audible is whichever is higher:
 
 ```
-max(room_floor x NOISE_FLOOR_MULT x sensitivity x BARGE_MULT,
-    echo_floor x ECHO_MULT)
+max(room_floor x NOISE_FLOOR_MULT x BARGE_MULT,
+    echo_floor x ECHO_MULT) x sensitivity
 ```
+
+Mic sensitivity scales **both** terms. Scaling only the first left the control
+with no effect whatsoever on interrupting, which is exactly when someone would
+reach for it. If barge-in is reluctant on your setup, raise it.
+
+Note "audible", not "replying": a sentence still being synthesised makes no
+sound, so it contributes no echo and uses the ordinary threshold. Cancelling it
+still takes the full `BARGE_START_MS`, because abandoning a reply is just as
+disruptive whether or not it has started coming out of the speaker.
 
 `BARGE_MULT` is deliberately small: echo rejection is `ECHO_MULT`'s job, and
 stacking both would make a noisy room deaf to real interruptions.
