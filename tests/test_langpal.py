@@ -163,6 +163,30 @@ class SplitSentences(unittest.TestCase):
             self.assertLessEqual(len(sentence), langpal.MAX_SENTENCE_CHARS)
         self.assertLess(len(rest), langpal.MAX_SENTENCE_CHARS)
 
+    def test_short_opener_does_not_split_off(self):
+        """A greeting shorter than the minimum must merge with what follows.
+
+        Regression: this reply produced three sentences one-shot but two while
+        streaming, because `final` was lowering the length bar mid-buffer.
+        """
+        reply = ("Bonjour ! Bien sur, je serais ravi de discuter avec toi "
+                 "pour t'aider a progresser. De quoi aimerais-tu parler ?")
+        one_shot, rest = langpal.split_sentences(reply, final=True)
+        self.assertEqual(rest, "")
+        self.assertEqual(len(one_shot), 2)
+        self.assertTrue(one_shot[0].startswith("Bonjour ! Bien sur"))
+
+        buf = ""
+        streamed = []
+        for i in range(0, len(reply), 4):
+            buf += reply[i:i + 4]
+            out, buf = langpal.split_sentences(buf)
+            streamed.extend(out)
+        out, buf = langpal.split_sentences(buf, final=True)
+        streamed.extend(out)
+        self.assertEqual([s.strip() for s in streamed],
+                         [s.strip() for s in one_shot])
+
     def test_streaming_matches_one_shot(self):
         """Feeding text token by token must produce the same sentences."""
         full = ("Merhaba, bugun nasilsin? Ben cok iyiyim, tesekkur ederim. "
@@ -477,6 +501,160 @@ class StaticRoutes(unittest.TestCase):
             self.assertIn(filename, langpal.STATIC_CACHE)
             self.assertGreater(len(langpal.STATIC_CACHE[filename]), 0)
 
+
+class LlamaSwapRouting(unittest.TestCase):
+    """llama-swap needs a model id on requests that have no body to route on."""
+
+    def setUp(self):
+        self.settings = langpal.validate_settings(
+            {"tts_url": "http://10.66.66.2:11435", "tts_model": "omnivoice"})
+
+    def test_bodyless_urls_carry_the_model(self):
+        url = langpal._tts_routed_url(self.settings, langpal.TTS_VOICES_PATH)
+        self.assertEqual(url, "http://10.66.66.2:11435/v1/audio/voices?model=omnivoice")
+
+    def test_model_name_is_percent_encoded(self):
+        settings = langpal.validate_settings(
+            {"tts_url": "http://h:1", "tts_model": "my model/v2"})
+        url = langpal._tts_routed_url(settings, langpal.HEALTH_PATH)
+        self.assertEqual(url, "http://h:1/health?model=my%20model%2Fv2")
+        self.assertNotIn(" ", url)
+
+    def test_register_payload_carries_the_model(self):
+        """The register POST has a body, so llama-swap routes on the model key."""
+        captured = {}
+
+        def fake(url, payload, **kwargs):
+            captured["url"] = url
+            captured["payload"] = payload
+            return {"status": "registered"}
+
+        original = langpal._request_json
+        langpal._request_json = fake
+        try:
+            langpal.register_voice("v", "text", b"RIFF", self.settings)
+        finally:
+            langpal._request_json = original
+
+        self.assertEqual(captured["payload"]["model"], "omnivoice")
+        self.assertEqual(captured["payload"]["name"], "v")
+
+    def test_delete_explains_a_404_from_llama_swap(self):
+        def fake(url, payload, **kwargs):
+            raise langpal.UpstreamError("HTTP 404 from %s: 404 page not found" % url,
+                                        status=404)
+
+        original = langpal._request_json
+        langpal._request_json = fake
+        try:
+            with self.assertRaises(langpal.UpstreamError) as caught:
+                langpal.delete_voice("v", self.settings)
+        finally:
+            langpal._request_json = original
+
+        message = str(caught.exception)
+        self.assertIn("upstream/omnivoice", message)
+        self.assertIn("no route", message)
+
+    def test_delete_does_not_swallow_other_failures(self):
+        def fake(url, payload, **kwargs):
+            raise langpal.UpstreamError("cannot reach host", status=None)
+
+        original = langpal._request_json
+        langpal._request_json = fake
+        try:
+            with self.assertRaises(langpal.UpstreamError) as caught:
+                langpal.delete_voice("v", self.settings)
+        finally:
+            langpal._request_json = original
+        self.assertEqual(str(caught.exception), "cannot reach host")
+
+
+class UpstreamErrorStatus(unittest.TestCase):
+    def test_status_defaults_to_none(self):
+        self.assertIsNone(langpal.UpstreamError("boom").status)
+
+    def test_status_is_kept(self):
+        self.assertEqual(langpal.UpstreamError("boom", status=502).status, 502)
+
+
+class BargeInThresholds(unittest.TestCase):
+    """The barge-in maths, checked against constants read out of web/app.js.
+
+    These four numbers decide whether the assistant talks over itself. Getting
+    them wrong is not a crash -- playback just stops a word into every reply,
+    which is how the bug that prompted this test presented. The constants are
+    parsed from the JavaScript rather than copied, so the test cannot drift
+    away from what actually ships.
+    """
+
+    #                        room    echo   the user's voice
+    SCENARIOS = (
+        ("headphones, quiet room",   0.002, 0.003, 0.10),
+        ("laptop speakers, normal",  0.003, 0.040, 0.15),
+        ("speakers loud, poor AEC",  0.004, 0.090, 0.20),
+        ("speakers very loud",       0.004, 0.160, 0.25),
+        ("noisy room, headphones",   0.020, 0.005, 0.15),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        import re
+        source = io.open(os.path.join(langpal.WEB_DIR, "app.js"),
+                         encoding="utf-8").read()
+        cls.const = {}
+        for name in ("NOISE_FLOOR_MULT", "MIN_RMS", "BARGE_MULT", "ECHO_MULT"):
+            match = re.search(r"const %s = ([0-9.]+);" % name, source)
+            assert match, "%s is missing from app.js" % name
+            cls.const[name] = float(match.group(1))
+
+    def threshold(self, room_rms, echo_rms, sensitivity=5):
+        """Mirrors currentThreshold() in app.js."""
+        sens_mul = 0.85 ** (sensitivity - 5)
+        base = max(room_rms * self.const["NOISE_FLOOR_MULT"],
+                   self.const["MIN_RMS"]) * sens_mul
+        # echoFloor is peak-held, so it settles at the echo's peak level.
+        return max(base * self.const["BARGE_MULT"],
+                   echo_rms * self.const["ECHO_MULT"])
+
+    def test_the_assistant_never_interrupts_itself(self):
+        for name, room, echo, _user in self.SCENARIOS:
+            with self.subTest(scenario=name):
+                self.assertLess(
+                    echo, self.threshold(room, echo),
+                    "%s: echo %.3f clears the bar, so playback cuts itself off"
+                    % (name, echo))
+
+    def test_the_user_can_still_interrupt(self):
+        for name, room, echo, user in self.SCENARIOS:
+            with self.subTest(scenario=name):
+                self.assertGreater(
+                    user, self.threshold(room, echo),
+                    "%s: speech at %.3f cannot be heard over the echo"
+                    % (name, user))
+
+    def test_raising_sensitivity_lowers_the_bar(self):
+        room, echo = 0.003, 0.003
+        bars = [self.threshold(room, echo, s) for s in (1, 5, 10)]
+        self.assertGreater(bars[0], bars[1])
+        self.assertGreater(bars[1], bars[2])
+
+    def test_echo_floor_dominates_when_playback_is_loud(self):
+        """The whole point: a loud speaker must raise the bar, not be ignored."""
+        quiet = self.threshold(0.003, 0.003)
+        loud = self.threshold(0.003, 0.160)
+        self.assertGreater(loud, quiet * 3)
+
+    def test_grace_window_is_long_enough_to_converge(self):
+        """ECHO_DECAY only matters between sentences; the grace covers onset."""
+        import re
+        source = io.open(os.path.join(langpal.WEB_DIR, "app.js"),
+                         encoding="utf-8").read()
+        grace = float(re.search(r"const BARGE_GRACE_MS = ([0-9.]+);", source).group(1))
+        start = float(re.search(r"const BARGE_START_MS = ([0-9.]+);", source).group(1))
+        # A peak-held floor converges on the first loud frame, but the window
+        # must still outlast the run of frames that would open a turn.
+        self.assertGreater(grace, start * 0.5)
 
 class ConfigExposure(unittest.TestCase):
     def test_no_secret_leaks_into_the_client_payload(self):

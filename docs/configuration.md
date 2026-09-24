@@ -42,6 +42,11 @@ the top of `langpal.py`; `.env.example` is a copy-ready template.
 | `LANGPAL_LLM_URL` | `http://127.0.0.1:11435` |
 | `LANGPAL_STT_URL` | `http://127.0.0.1:11435` |
 | `LANGPAL_TTS_URL` | `http://127.0.0.1:8123` |
+
+Behind llama-swap, prefer the per-model route for TTS:
+`http://10.66.66.2:11435/upstream/omnivoice`. The plain main port works for
+everything except removing a voice — see
+[upstream-apis.md](upstream-apis.md#what-works-on-which-url).
 | `LANGPAL_LLM_MODEL` | `gemma4-26b-a4b` |
 | `LANGPAL_STT_MODEL` | `qwen3-asr` |
 | `LANGPAL_TTS_MODEL` | `omnivoice` |
@@ -156,8 +161,36 @@ Stored in `localStorage`, never sent to the server.
 | Send automatically | on | off = the turn is captured but not sent |
 
 Fixed tuning constants live at the top of `web/app.js`: `SPEECH_START_MS`
-(140), `BARGE_START_MS` (320), `PREROLL_MS` (320), `MIN_UTTERANCE_MS` (350),
-`MAX_UTTERANCE_MS` (60000), `NOISE_FLOOR_MULT` (3.2), `BARGE_MULT` (2.2).
+(140), `BARGE_START_MS` (420), `PREROLL_MS` (320), `MIN_UTTERANCE_MS` (350),
+`MAX_UTTERANCE_MS` (60000), `NOISE_FLOOR_MULT` (3.2), `BARGE_MULT` (1.6),
+`ECHO_MULT` (1.5), `ECHO_DECAY` (0.995), `BARGE_GRACE_MS` (600).
+
+### How the assistant avoids interrupting itself
+
+The room's noise floor only adapts on quiet frames, so it freezes as soon as
+playback starts. On its own that leaves the bar where a silent room put it,
+which the assistant's own voice through a speaker clears easily -- the reply
+then cuts itself off a word in.
+
+So a second, peak-held **echo floor** tracks how loud our own output comes back
+through the microphone. It jumps to any new peak and decays slowly
+(`ECHO_DECAY`), staying high through the gaps between sentences. The bar while
+speaking is whichever is higher:
+
+```
+max(room_floor x NOISE_FLOOR_MULT x sensitivity x BARGE_MULT,
+    echo_floor x ECHO_MULT)
+```
+
+`BARGE_MULT` is deliberately small: echo rejection is `ECHO_MULT`'s job, and
+stacking both would make a noisy room deaf to real interruptions.
+
+For the first `BARGE_GRACE_MS` of each sentence nothing can trigger a barge-in,
+because the echo floor has not caught up with the new audio yet.
+
+`tests/test_langpal.py::BargeInThresholds` parses these constants out of
+`app.js` and checks, across five speaker and headphone scenarios, that the
+assistant never clears its own bar and that a person always does.
 
 ## Default voices
 

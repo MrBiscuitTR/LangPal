@@ -226,6 +226,9 @@ URL_STRIP_SUFFIXES = (
 #
 # Runs in a background thread so a cold model load never delays the server.
 DEFAULT_VOICES_DIR = _env("LANGPAL_VOICES_DIR") or os.path.join(HERE, "voices_default")
+# Recognised as audio, but not usable here: the TTS registry takes WAV and the
+# standard library cannot decode these. Used only to warn instead of ignoring.
+AUDIO_EXTENSIONS = (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".wma", ".webm")
 REGISTER_DEFAULT_VOICES = _env_flag("LANGPAL_REGISTER_DEFAULT_VOICES", True)
 
 # --- Generation defaults (client-settable) ---------------------------------
@@ -410,7 +413,15 @@ class TooLarge(BadRequest):
 
 
 class UpstreamError(Exception):
-    """An upstream endpoint failed or was unreachable. Becomes a 502."""
+    """An upstream endpoint failed or was unreachable. Becomes a 502.
+
+    `status` is the upstream HTTP status when there was one, else None. It lets
+    callers distinguish "this route does not exist" from "the box is down".
+    """
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 class Aborted(Exception):
@@ -723,13 +734,16 @@ def _upstream_request(url, *, data=None, method=None, headers=None, api_key="", 
         return _OPENER.open(req, timeout=timeout)
     except urllib.error.HTTPError as exc:
         try:
-            body = exc.read().decode("utf-8", "replace")
+            # Stripped: upstream error bodies often end in a newline, which
+            # would break a sentence when this is embedded in a longer message.
+            body = exc.read().decode("utf-8", "replace").strip()
         except Exception:                      # noqa: BLE001 - body is best effort
             body = ""
         finally:
             exc.close()
         raise UpstreamError("HTTP %d from %s: %s" % (
-            exc.code, _safe_url(url), body[:MAX_ERROR_ECHO_CHARS])) from exc
+            exc.code, _safe_url(url), body[:MAX_ERROR_ECHO_CHARS]),
+            status=exc.code) from exc
     except urllib.error.URLError as exc:
         raise UpstreamError("cannot reach %s (%s)" % (_safe_url(url), exc.reason)) from exc
     except (socket.timeout, TimeoutError) as exc:
@@ -934,7 +948,12 @@ def split_sentences(buf: str, *, final: bool = False):
             if (after_is_break or cjk) and not (ch == "." and _is_abbreviation(buf, i)):
                 candidate = buf[start:end].strip()
                 minimum = MIN_SENTENCE_CHARS_CJK if cjk else MIN_SENTENCE_CHARS
-                if len(candidate) >= minimum or (final and candidate):
+                # `final` must not lower this bar. It only means "flush the
+                # trailing remainder", which the block below does. Letting it
+                # split short mid-buffer fragments made a one-shot call disagree
+                # with the streaming path: "Bonjour ! Bien sur, ..." came out as
+                # three sentences one way and two the other.
+                if len(candidate) >= minimum:
                     sentences.append(candidate)
                     start = end
             i = end
@@ -1004,6 +1023,21 @@ def speakable(text: str) -> str:
 # Text to speech
 # ---------------------------------------------------------------------------
 
+def _tts_routed_url(settings: dict, path: str) -> str:
+    """A TTS URL carrying llama-swap's ?model= routing hint.
+
+    llama-swap chooses a backend from the "model" field in the request body, so
+    a bodyless request (GET /v1/audio/voices, GET /health) cannot be routed and
+    is answered with "no model id could be identified". Passing the model as a
+    query parameter routes it, and also triggers the model load.
+
+    Anything that is not llama-swap ignores the extra parameter, so this is
+    safe to send unconditionally -- verified against omnivoice.cpp directly.
+    """
+    return "%s%s?model=%s" % (settings["tts_url"], path,
+                              urllib.parse.quote(settings["tts_model"], safe=""))
+
+
 def synthesize(text: str, settings: dict, language: str) -> bytes:
     """Ask the TTS endpoint for one WAV. Returns the raw bytes."""
     payload = {
@@ -1027,7 +1061,7 @@ def synthesize(text: str, settings: dict, language: str) -> bytes:
 
 def list_voices(settings: dict):
     """GET the registered + built-in voice names from the TTS server."""
-    url = settings["tts_url"] + TTS_VOICES_PATH
+    url = _tts_routed_url(settings, TTS_VOICES_PATH)
     data = _request_json(url, None, api_key=TTS_API_KEY, timeout=VOICES_TIMEOUT, method="GET")
     raw = data.get("voices", []) if isinstance(data, dict) else []
     names = []
@@ -1043,6 +1077,8 @@ def register_voice(name: str, ref_text: str, wav: bytes, settings: dict):
     """Register a cloned voice from a reference clip and its transcript."""
     url = settings["tts_url"] + TTS_VOICES_PATH
     payload = {
+        # Present so llama-swap can route this POST; the TTS server ignores it.
+        "model": settings["tts_model"],
         "name": name,
         "ref_text": ref_text,
         "wav_b64": base64.b64encode(wav).decode("ascii"),
@@ -1052,8 +1088,24 @@ def register_voice(name: str, ref_text: str, wav: bytes, settings: dict):
 
 def delete_voice(name: str, settings: dict):
     """Remove a registered voice. `name` must already have passed VOICE_NAME_RE."""
-    url = settings["tts_url"] + TTS_VOICES_PATH + "/" + urllib.parse.quote(name, safe="")
-    return _request_json(url, None, api_key=TTS_API_KEY, timeout=VOICES_TIMEOUT, method="DELETE")
+    url = "%s%s/%s?model=%s" % (
+        settings["tts_url"], TTS_VOICES_PATH, urllib.parse.quote(name, safe=""),
+        urllib.parse.quote(settings["tts_model"], safe=""))
+    try:
+        return _request_json(url, None, api_key=TTS_API_KEY,
+                             timeout=VOICES_TIMEOUT, method="DELETE")
+    except UpstreamError as exc:
+        if exc.status == 404:
+            # llama-swap only pattern-matches /v1/audio/voices, not the
+            # /<name> sub-path, so DELETE cannot reach the backend through its
+            # main port however it is routed. The per-model prefix can.
+            raise UpstreamError(
+                "could not delete %r: %s. If your TTS endpoint is llama-swap's "
+                "main port, it has no route for %s/<name>. Set the TTS URL to "
+                "%s/upstream/%s, or point it straight at the TTS server."
+                % (name, exc, TTS_VOICES_PATH, settings["tts_url"],
+                   settings["tts_model"]), status=404) from exc
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -1074,7 +1126,14 @@ def scan_default_voices(directory: str):
         return found
     for entry in entries:
         stem, ext = os.path.splitext(entry)
-        if ext.lower() != ".wav":
+        ext = ext.lower()
+        if ext != ".wav":
+            # Say so rather than ignoring it. The registry only takes WAV, and
+            # there is no stdlib decoder for anything else, so an mp3 dropped
+            # in here would otherwise just never appear in the voice list.
+            if ext in AUDIO_EXTENSIONS:
+                log("  voices_default: %s is not a WAV -- convert it, or add it "
+                    "through the Voices panel, which decodes in the browser" % entry)
             continue
         wav_path = os.path.join(directory, entry)
         if not os.path.isfile(wav_path):
@@ -1560,7 +1619,7 @@ class Handler(BaseHTTPRequestHandler):
         for name, url in (
             ("llm", settings["llm_url"] + LLM_MODELS_PATH),
             ("stt", settings["stt_url"] + LLM_MODELS_PATH),
-            ("tts", settings["tts_url"] + HEALTH_PATH),
+            ("tts", _tts_routed_url(settings, HEALTH_PATH)),
         ):
             started = time.monotonic()
             try:
@@ -1712,18 +1771,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Accel-Buffering", "no")
-        self.send_header("Connection", "close")
+        # Chunked, not close-delimited. Framing the body by closing the socket
+        # works over plain HTTP, but under TLS Python closes the SSLSocket
+        # without sending close_notify, so the browser sees a truncated stream
+        # and reports a network error even though every byte arrived. A chunked
+        # body is self-framing, so the end of the stream is unambiguous.
+        self.send_header("Transfer-Encoding", "chunked")
         for key, value in SECURITY_HEADERS.items():
             self.send_header(key, value)
         if cookie:
             self.send_header("Set-Cookie", cookie)
         self.end_headers()
-        # No Content-Length, so the connection must close to frame the body.
-        self.close_connection = True
+
+        def write_chunk(data):
+            """Write one HTTP chunk: length in hex, CRLF, payload, CRLF."""
+            self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
 
         def emit(event, payload):
-            chunk = "event: %s\ndata: %s\n\n" % (event, json.dumps(payload))
-            self.wfile.write(chunk.encode("utf-8"))
+            frame = "event: %s\ndata: %s\n\n" % (event, json.dumps(payload))
+            write_chunk(frame.encode("utf-8"))
 
         buffer = ""
         visible = []
@@ -1739,7 +1805,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not shown:
                     # Still inside a think block: keep the socket warm.
                     if time.monotonic() - last_beat > SSE_HEARTBEAT_SECONDS:
-                        self.wfile.write(b": ping\n\n")
+                        write_chunk(b": ping\n\n")
                         last_beat = time.monotonic()
                     continue
                 visible.append(shown)
@@ -1780,6 +1846,13 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 emit("error", {"message": "internal error"})
             except Exception:                   # noqa: BLE001
+                pass
+        finally:
+            # The zero-length chunk terminates the body. Without it the client
+            # keeps waiting, whatever else went wrong above.
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+            except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
 
 

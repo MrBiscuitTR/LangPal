@@ -22,17 +22,37 @@ const TARGET_RATE = 16000;        // what we send to the ASR model
 const VOICE_SAMPLE_RATE = 24000;  // reference clips: match OmniVoice's own rate
 
 const SPEECH_START_MS = 140;      // sustained speech before a turn opens
-const BARGE_START_MS = 320;       // longer while the assistant is talking
+const BARGE_START_MS = 420;       // longer while the assistant is talking
 const MAX_UTTERANCE_MS = 60000;   // hard stop, below the server's 90 s limit
 const PREROLL_MS = 320;           // audio kept from just before speech began
 const MIN_UTTERANCE_MS = 350;     // shorter than this is a cough, not a turn
 
 const NOISE_FLOOR_MULT = 3.2;     // speech must beat the room by this much
 const MIN_RMS = 0.012;            // absolute floor, for very quiet rooms
-const BARGE_MULT = 2.2;           // extra margin so the reply cannot trigger itself
+const BARGE_MULT = 1.6;           // modest margin over the room floor; echo
+                                  // rejection is ECHO_MULT's job, and stacking
+                                  // both would deafen us in a noisy room
 const FLOOR_ATTACK = 0.02;        // how fast the noise floor tracks the room
 
+// Echo handling. The room's noise floor only adapts on quiet frames, so it
+// freezes the moment playback starts and the bar stays where a silent room
+// put it -- which the assistant's own voice then clears, cutting itself off.
+// A separate peak-hold floor tracks how loud our output comes back: it rises
+// instantly and decays slowly, so it stays high through the gaps between
+// sentences instead of collapsing and re-triggering on the next one.
+const ECHO_DECAY = 0.995;         // per frame; roughly halves over a second
+const ECHO_MULT = 1.5;            // speech must beat the echo by this much;
+                                  // safe to keep low because the floor is peak-held
+const BARGE_GRACE_MS = 600;       // deaf at the start of a sentence, while
+                                  // the echo floor is still converging
+
 const LEVEL_DECAY = 0.82;         // smoothing for the on-screen level bar
+
+// How many sentences may be at the TTS endpoint at once. Two is enough to
+// keep the next one ready before the current finishes, and few enough that
+// pressing Stop wastes at most one synthesis. A typical backend runs with
+// --parallel 1 and serialises them anyway.
+const MAX_TTS_INFLIGHT = 2;
 
 const DEFAULT_LOCAL = {
   silenceMs: 900,                 // silence that ends a turn
@@ -83,6 +103,7 @@ const audio = {
 const vad = {
   mode: 'idle',           // idle | speech
   floor: MIN_RMS,
+  echoFloor: 0,           // how loud our own playback returns through the mic
   chunks: [],
   totalSamples: 0,
   preroll: [],
@@ -92,10 +113,12 @@ const vad = {
 };
 
 const tts = {
-  queue: [],
+  pending: [],            // sentence texts not yet sent for synthesis
+  inflight: [],           // { text, audio: Promise<AudioBuffer> }, in play order
   streaming: false,       // the chat stream is still producing sentences
   running: false,         // the playback worker loop is alive
   source: null,           // currently playing AudioBufferSourceNode
+  startedAt: 0,           // when the current sentence began, for the grace window
 };
 
 /* ---------------------------------------------------------------------------
@@ -259,13 +282,48 @@ function currentThreshold() {
   // Higher sensitivity lowers the bar. 0.85^(s-5) maps 1..10 to ~1.9..0.44.
   const sensMul = Math.pow(0.85, (state.local.sensitivity || 5) - 5);
   const base = Math.max(vad.floor * NOISE_FLOOR_MULT, MIN_RMS) * sensMul;
-  // While the assistant is speaking, demand more so its own voice leaking
-  // through the speaker cannot open a turn on its own.
-  return isSpeaking() ? base * BARGE_MULT : base;
+  if (!isSpeaking()) return base;
+  // While the assistant is speaking, the bar is whichever is higher: the
+  // usual threshold with extra margin, or a margin above the measured echo.
+  // The second term is what adapts to speaker volume and room acoustics.
+  return Math.max(base * BARGE_MULT, vad.echoFloor * ECHO_MULT);
 }
 
 function isSpeaking() {
   return tts.running || tts.source !== null;
+}
+
+// The browser's own wording for a refused microphone -- "not allowed by the
+// user agent or the platform in the current context" -- covers half a dozen
+// unrelated causes and points at none of them. Name the likely ones instead.
+function describeMicError(err) {
+  const name = (err && err.name) || '';
+
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+    return 'No microphone found. Check that one is connected and enabled.';
+  }
+  if (name === 'NotReadableError' || name === 'TrackStartError') {
+    return 'The microphone is in use by another application, or the system '
+         + 'refused access to it. Close anything else that is recording.';
+  }
+  if (name === 'SecurityError') {
+    return 'The browser blocked microphone access because this page is not a '
+         + 'trusted secure context. See docs/hosting.md.';
+  }
+  if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+    // Three genuinely different causes share this one error name, so list
+    // them in the order they are worth checking.
+    return 'Microphone permission was refused. Three things cause this: '
+         + '(1) the permission prompt was dismissed or previously blocked -- '
+         + 'clear it from the padlock icon in the address bar; '
+         + '(2) Windows is blocking it -- Settings, Privacy & security, '
+         + 'Microphone, and turn on access for desktop apps; '
+         + '(3) you clicked through a certificate warning to reach this page, '
+         + 'and the browser will not grant the microphone on an origin whose '
+         + 'certificate it does not trust. See docs/hosting.md for how to make '
+         + 'the certificate genuinely trusted.';
+  }
+  return 'Could not open the microphone: ' + (err && (err.message || err.name) || err);
 }
 
 async function ensureAudio() {
@@ -279,16 +337,20 @@ async function ensureAudio() {
     );
   }
 
-  audio.stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      channelCount: 1,
-      // Browser-side acoustic echo cancellation is what makes barge-in work
-      // when the reply is coming out of the same device's speaker.
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    },
-  });
+  try {
+    audio.stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        // Browser-side acoustic echo cancellation is what makes barge-in work
+        // when the reply is coming out of the same device's speaker.
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+  } catch (err) {
+    throw new Error(describeMicError(err));
+  }
 
   // Two contexts on purpose: capture is pinned to 16 kHz so no resampling is
   // needed in the common case, while playback runs at the device's native rate
@@ -345,6 +407,12 @@ function onFrame(frame) {
   // interrupt while the model is still generating.
   if (state.busy && vad.mode === 'idle' && !isSpeaking()) return;
 
+  // Track how loud our own output returns while we are not mid-utterance.
+  // Peak-hold: jump straight to any new peak, decay gently otherwise.
+  if (isSpeaking() && vad.mode === 'idle') {
+    vad.echoFloor = Math.max(rms, vad.echoFloor * ECHO_DECAY);
+  }
+
   const loud = rms > currentThreshold();
 
   if (vad.mode === 'idle') {
@@ -357,6 +425,13 @@ function onFrame(frame) {
     const prerollCap = msToSamples(PREROLL_MS, rate);
     while (vad.prerollSamples > prerollCap && vad.preroll.length > 1) {
       vad.prerollSamples -= vad.preroll.shift().length;
+    }
+
+    // The first moments of a sentence are the worst time to judge: the echo
+    // floor has not caught up with the new audio yet.
+    if (isSpeaking() && Date.now() - tts.startedAt < BARGE_GRACE_MS) {
+      vad.loudSamples = 0;
+      return;
     }
 
     const needed = msToSamples(isSpeaking() ? BARGE_START_MS : SPEECH_START_MS, rate);
@@ -380,7 +455,8 @@ function onFrame(frame) {
 function beginUtterance() {
   // Speaking over the assistant cancels it, which is the whole point of
   // barge-in. Also cancels any queued synthesis on the server.
-  if (isSpeaking()) stopEverything();
+  const interrupting = isSpeaking();
+  if (interrupting) stopEverything();
 
   vad.mode = 'speech';
   vad.chunks = vad.preroll.slice();      // keep the word that opened the turn
@@ -389,7 +465,9 @@ function beginUtterance() {
   vad.prerollSamples = 0;
   vad.loudSamples = 0;
   vad.quietSamples = 0;
-  setStatus('listening…', 'live');
+  // Say so when we cut the assistant off, so a self-interruption is visible
+  // rather than looking like the reply simply stopped.
+  setStatus(interrupting ? 'interrupted, listening…' : 'listening…', 'live');
 }
 
 function endUtterance() {
@@ -504,7 +582,10 @@ async function runChat(text) {
         bubble.textContent += data.t;
         scrollTranscript();
       } else if (event === 'sentence') {
-        tts.queue.push(data.text);
+        // Queue it and start synthesising straight away, rather than
+        // waiting for its turn to play.
+        tts.pending.push(data.text);
+        pumpTts();
         startTtsWorker();
       } else if (event === 'done') {
         if (!bubble.textContent) bubble.remove();
@@ -583,30 +664,54 @@ async function fetchSentenceAudio(text) {
       try { message = (await resp.json()).error || message; } catch (err) { /* keep */ }
       throw new Error(message);
     }
-    return await resp.arrayBuffer();
+    // Decode here rather than at playback time: doing it on this path
+    // means the buffer is ready the instant the previous sentence ends.
+    return await decodeAudio(await resp.arrayBuffer());
   } finally {
     state.ttsControllers.delete(controller);
   }
 }
 
-function playBuffer(buffer) {
+// Callback form, wrapped: older Safari has no promise-returning overload.
+function decodeAudio(raw) {
+  if (!audio.playCtx) audio.playCtx = new AudioContext();
   return new Promise((resolve, reject) => {
-    // decodeAudioData detaches the ArrayBuffer, so nothing else may reuse it.
+    // decodeAudioData detaches the ArrayBuffer; nothing else may reuse it.
     audio.playCtx.decodeAudioData(
-      buffer,
-      (decoded) => {
-        const source = audio.playCtx.createBufferSource();
-        source.buffer = decoded;
-        source.connect(audio.playCtx.destination);
-        source.onended = () => {
-          if (tts.source === source) tts.source = null;
-          resolve();
-        };
-        tts.source = source;
-        source.start();
-      },
+      raw,
+      resolve,
       (err) => reject(err || new Error('could not decode the reply audio'))
     );
+  });
+}
+
+// Start synthesising whatever is waiting, up to the concurrency limit.
+// Called when a sentence arrives and again whenever a slot frees, so work
+// begins as early as possible instead of at playback time.
+function pumpTts() {
+  while (tts.inflight.length < MAX_TTS_INFLIGHT && tts.pending.length) {
+    const text = tts.pending.shift();
+    const audio = fetchSentenceAudio(text);
+    // Stop drops the whole list, so a rejection here may end up with nobody
+    // awaiting it. Attach a no-op handler to keep it from surfacing as an
+    // unhandled rejection; the worker still sees the rejection when it awaits.
+    audio.catch(() => {});
+    tts.inflight.push({ text: text, audio: audio });
+  }
+}
+
+function playDecoded(decoded) {
+  return new Promise((resolve) => {
+    const source = audio.playCtx.createBufferSource();
+    source.buffer = decoded;
+    source.connect(audio.playCtx.destination);
+    source.onended = () => {
+      if (tts.source === source) tts.source = null;
+      resolve();
+    };
+    tts.source = source;
+    tts.startedAt = Date.now();
+    source.start();
   });
 }
 
@@ -617,41 +722,36 @@ function startTtsWorker() {
     if (err && err.name !== 'AbortError') setStatus(String(err.message || err), 'error');
   }).finally(() => {
     tts.running = false;
+    // Forget the echo level; the next reply measures its own.
+    vad.echoFloor = 0;
     el('btn-stop').disabled = true;
     if (state.listening) setStatus('ready', 'live');
   });
 }
 
-// Plays sentences strictly in order while fetching the next one in parallel,
-// so the gap between sentences is hidden by the previous sentence's playback.
+// Plays sentences strictly in order. Synthesis has already been started by
+// pumpTts() when each sentence arrived, so this loop usually finds the next
+// buffer already decoded and the join between sentences is inaudible.
 async function ttsWorker() {
-  let prefetch = null;
-
   for (;;) {
-    let job = prefetch;
-    prefetch = null;
+    pumpTts();
 
-    if (!job) {
-      if (tts.queue.length) {
-        const text = tts.queue.shift();
-        job = { text: text, audio: fetchSentenceAudio(text) };
-      } else if (tts.streaming) {
-        await new Promise((resolve) => setTimeout(resolve, 40));
+    if (!tts.inflight.length) {
+      // Nothing synthesising. Either more sentences are still coming, or
+      // the reply is finished and this worker is done.
+      if (tts.streaming || tts.pending.length) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
         continue;
-      } else {
-        return;   // nothing queued and the stream is finished
       }
+      return;
     }
 
-    // Start the next synthesis now so it overlaps this sentence's playback.
-    if (tts.queue.length) {
-      const next = tts.queue.shift();
-      prefetch = { text: next, audio: fetchSentenceAudio(next) };
-    }
+    const job = tts.inflight.shift();
+    pumpTts();   // a slot just freed, so start the sentence after next
 
-    let buffer;
+    let decoded;
     try {
-      buffer = await job.audio;
+      decoded = await job.audio;
     } catch (err) {
       if (err.name === 'AbortError') return;
       note(String(err.message || err), true);
@@ -660,7 +760,7 @@ async function ttsWorker() {
 
     setStatus('speaking…', 'live');
     try {
-      await playBuffer(buffer);
+      await playDecoded(decoded);
     } catch (err) {
       note(String(err.message || err), true);
     }
@@ -674,7 +774,8 @@ async function ttsWorker() {
 // Halts playback, drops queued sentences, aborts in-flight requests and bumps
 // the server-side epoch so work already queued upstream is discarded too.
 function stopEverything() {
-  tts.queue.length = 0;
+  tts.pending.length = 0;
+  tts.inflight.length = 0;
   tts.streaming = false;
 
   if (tts.source) {

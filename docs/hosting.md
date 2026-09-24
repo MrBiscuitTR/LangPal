@@ -94,6 +94,78 @@ A warning you have to click through is not a weakness here: the traffic is
 already inside WireGuard, and the certificate is only proving the box to
 itself.
 
+### If the microphone is still refused: make the certificate trusted
+
+A self-signed certificate you click past leaves the origin in a half-trusted
+state. Browsers treat such an origin as a secure context for *loading* the page
+but refuse permission-gated APIs on it, so `getUserMedia` fails with:
+
+> The request is not allowed by the user agent or the platform in the current
+> context.
+
+LangPal turns that into a message naming the three things that cause it. Check
+them in this order:
+
+1. **The permission prompt.** Dismissed, or blocked earlier for this origin.
+   Click the padlock in the address bar and clear the microphone permission,
+   then reload.
+2. **Windows.** Settings → Privacy & security → Microphone. Both *Microphone
+   access* and *Let desktop apps access your microphone* must be on, or every
+   browser on the machine is blocked at the OS level.
+3. **Certificate trust.** Fixed below.
+
+To fix trust properly, issue the server certificate from your own small CA and
+trust the CA once per device. Then there is no warning to click through, and
+the origin is fully trusted:
+
+```bash
+# 1. A CA, valid for 10 years. Keep ca.key private; it can mint certificates
+#    that every device you trust it on will accept.
+openssl req -x509 -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout ca.key -out ca.pem -sha256 -days 3650 -nodes \
+  -subj "/CN=LangPal local CA" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+# 2. A key and signing request for the server.
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout key.pem -out server.csr -nodes -subj "/CN=langpal"
+
+# 3. The server certificate, signed by the CA. 398 days keeps Safari happy.
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+  -out cert.pem -days 398 -sha256 \
+  -extfile <(printf "subjectAltName=IP:10.66.66.2,IP:127.0.0.1,DNS:localhost\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth")
+```
+
+> The `<(...)` process substitution needs bash. In PowerShell, write those four
+> lines to `ext.cnf` and pass `-extfile ext.cnf` instead.
+
+Verify before trusting it:
+
+```bash
+openssl verify -CAfile ca.pem cert.pem          # expect: cert.pem: OK
+openssl x509 -in cert.pem -noout -ext subjectAltName
+```
+
+LangPal keeps using `cert.pem` and `key.pem`, so no configuration changes. Now
+trust **`ca.pem`** — not the server certificate — on each device:
+
+- **Windows** — double-click `ca.pem` → Install Certificate → Local Machine →
+  Place all certificates in the following store → *Trusted Root Certification
+  Authorities*. Chrome and Edge use this store.
+- **Firefox** — has its own store: Settings → Privacy & Security → Certificates
+  → View Certificates → Authorities → Import → tick *Trust this CA to identify
+  websites*.
+- **Android** — Settings → Security → Encryption & credentials → Install a
+  certificate → CA certificate.
+- **iOS / iPadOS** — AirDrop or email `ca.pem` to the device, install the
+  profile (Settings → General → VPN & Device Management), then **also** enable
+  it under Settings → General → About → Certificate Trust Settings. iOS ignores
+  the profile until you do that second step.
+
+`ca.key` never leaves your machine, and `.gitignore` already excludes `*.pem`
+and `*.key` so none of this can be committed by accident.
+
 ### The alternative, for desktop Chrome only
 
 If you would rather not deal with certificates and only use desktop Chrome or
@@ -206,19 +278,24 @@ groups:
 `swap: false` matters. Without it, every turn evicts and reloads a model and
 the conversation stalls for tens of seconds each time.
 
-### The one llama-swap gotcha
+### Which TTS URL to use
 
-llama-swap picks a backend from the `model` field in the **request body**.
-`GET /v1/audio/voices` has no body, so it answers:
+llama-swap picks a backend from the `model` field in the **request body**, so
+the bodyless voice-registry calls need help. LangPal appends `?model=<name>` to
+them automatically, which covers listing and registering on the plain main
+port.
 
-```json
-{"error":{"message":"no model id could be identified","code":"not_found"}}
+One call cannot be rescued that way: `DELETE /v1/audio/voices/<name>` has no
+route pattern in llama-swap at all, so removing a voice fails on the main port
+however it is routed. Use the per-model prefix and everything works:
+
+```
+LANGPAL_TTS_URL=http://10.66.66.2:11435/upstream/omnivoice
 ```
 
-Point the TTS URL at the container directly (`http://127.0.0.1:8123`) or at
-llama-swap's explicit per-model route
-(`http://10.66.66.2:11435/upstream/omnivoice`). Both work; the second also
-triggers the model load. Plain `http://10.66.66.2:11435` breaks voice listing.
+That form also triggers the model load, which pointing straight at the
+container (`http://127.0.0.1:8123`) does not. The full matrix is in
+[upstream-apis.md](upstream-apis.md#what-works-on-which-url).
 
 LangPal's URL cleanup preserves an `/upstream/<model>` prefix precisely so this
 stays usable.

@@ -42,6 +42,15 @@ response would have been marginally faster to first sound and much harder to
 cancel cleanly — with discrete requests, stopping is just `AbortController`
 plus an epoch bump.
 
+**Synthesis starts when a sentence arrives, not when it is due to play.** This
+is the difference between a seamless reply and an audible stall. An earlier
+version prefetched the next sentence only if it was already queued when the
+current one began playing — which it never is, because the model is still
+generating it. Every join then cost a full round trip. Measured on the
+reference stack: gaps of 0.96 s and 0.91 s became 0.00 s. `pumpTts()` keeps up
+to `MAX_TTS_INFLIGHT` (2) sentences at the endpoint, and decoding happens on
+the fetch path so the buffer is ready the instant the previous sentence ends.
+
 **Two `AudioContext`s.** Capture is pinned to 16 kHz so no resampling is needed
 in the common case; playback runs at the device's native rate so the 24 kHz
 reply is not degraded on its way out. If the browser refuses the 16 kHz hint,

@@ -199,3 +199,7 @@ example-speak.py
 # lines if you want to share a set of default voices with the repo.
 voices_default/*.wav
 voices_default/*.txt
+voices_default/*.mp3
+voices_default/*.m4a
+voices_default/*.flac
+voices_default/*.ogg

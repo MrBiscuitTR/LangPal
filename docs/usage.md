@@ -31,9 +31,17 @@ you hear the first sentence while the rest is still being generated.
 
 ### Interrupting
 
-Talk over the reply and it stops. That is on by default and relies on your
-browser's echo cancellation, which works best with headphones. On speakers, at
-high volume, the assistant can occasionally interrupt itself; two ways out:
+Talk over the reply and it stops. That is on by default.
+
+LangPal measures how loud its own voice comes back through your microphone and
+raises the bar to match, so playing through speakers does not make it cut
+itself off. It also ignores the first half-second of each sentence, while that
+measurement settles. When an interruption does fire, the status line says
+`interrupted, listening…`, so you can tell a barge-in from a reply that simply
+stopped.
+
+If it still interrupts itself -- very loud speakers in a small room -- two ways
+out:
 
 - turn **Let me interrupt while it is speaking** off in Settings, which mutes
   the microphone while the reply plays, or

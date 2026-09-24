@@ -29,9 +29,11 @@ Change them there if your server puts the routes elsewhere.
 on one port and loads them on demand, choosing which by the **`model` field in
 the request body**.
 
-### The gotcha: bodyless requests cannot be routed
+### Routing requests that have no model in the body
 
-`GET /v1/audio/voices` has no body, so there is no model id to route on:
+llama-swap reads the `model` field from the request body to decide which
+backend to use. `POST /v1/audio/speech` carries one, so it routes fine. The
+voice-registry calls are the problem:
 
 ```console
 $ curl http://10.66.66.2:11435/v1/audio/voices
@@ -39,22 +41,68 @@ $ curl http://10.66.66.2:11435/v1/audio/voices
  "type":"invalid_request_error","code":"not_found"}}
 ```
 
-Two working options:
+**A `?model=` query parameter routes it.** This is the fix LangPal uses, and it
+also triggers the model load:
 
 ```console
-$ curl http://127.0.0.1:8123/v1/audio/voices                      # the container
+$ curl "http://10.66.66.2:11435/v1/audio/voices?model=omnivoice"
 {"voices":[{"name":"en_nature"}]}
 
-$ curl http://10.66.66.2:11435/upstream/omnivoice/v1/audio/voices # explicit route
-{"voices":[{"name":"en_nature"}]}
+$ curl "http://10.66.66.2:11435/v1/audio/voices?model=omnovoice"   # typo
+{"src":"llama-swap","error":{"message":"no router for requested model", …}}
 ```
 
-The `/upstream/<model>` form also triggers the model load, which the direct
-port does not.
+`_tts_routed_url()` appends it to every bodyless TTS request, and
+`register_voice()` puts a `model` key in its JSON body for the same reason.
+A server that is not llama-swap ignores both — verified by sending them
+straight to omnivoice.cpp, which answered normally.
+
+### What works on which URL
+
+| Request | main port | main port + `?model=` | `/upstream/<model>` | the container |
+| --- | :-: | :-: | :-: | :-: |
+| `POST /v1/audio/speech` | yes¹ | yes | yes | yes |
+| `GET /v1/audio/voices` | no | **yes** | yes | yes |
+| `POST /v1/audio/voices` | no | yes² | yes | yes |
+| `DELETE /v1/audio/voices/<name>` | **no** | **no** | yes | yes |
+| `GET /health` | yes³ | yes | yes | yes |
+
+¹ the body already carries `model`.
+² LangPal adds `model` to the register body.
+³ llama-swap answers with its *own* health, not the backend's.
+
+### The one that cannot be fixed with a query parameter
+
+`DELETE /v1/audio/voices/<name>` fails on the main port no matter how it is
+routed, because llama-swap has no route pattern for that sub-path at all. It
+returns Go's plain-text 404 rather than its usual JSON error, which is the
+tell:
+
+```console
+$ curl -X DELETE "http://10.66.66.2:11435/v1/audio/voices/tr_ayse?model=omnivoice"
+404 page not found
+
+$ curl -X DELETE "http://10.66.66.2:11435/upstream/omnivoice/v1/audio/voices/tr_ayse"
+{"status":"deleted"}
+```
+
+`delete_voice()` detects the 404 and says exactly this, naming the URL to
+switch to, rather than passing a bare 404 up to the user.
+
+### Recommended TTS URL
+
+```
+LANGPAL_TTS_URL=http://10.66.66.2:11435/upstream/omnivoice
+```
+
+Everything works on that form, including removing voices, and llama-swap still
+loads the model on demand. The plain main port works for everything except
+deletion; the container's own port works for everything but never triggers a
+load.
 
 This is why `normalize_base_url()` strips only known API suffixes instead of
-discarding the path: `http://h:11435/upstream/omnivoice/v1` has to normalise to
-`http://h:11435/upstream/omnivoice`, not `http://h:11435`.
+discarding the path — `http://h:11435/upstream/omnivoice/v1` has to normalise
+to `http://h:11435/upstream/omnivoice`, not `http://h:11435`.
 
 ### Keeping models resident
 
