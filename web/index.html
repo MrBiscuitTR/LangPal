@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover so the control bar can clear an iPhone home indicator -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>LangPal</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- Password gate. Only shown when the server was started with LANGPAL_TOKEN. -->
+<div id="gate" class="overlay" hidden>
+  <form id="login-form" class="panel narrow">
+    <h1>LangPal</h1>
+    <label for="login-token">Password</label>
+    <input id="login-token" type="password" autocomplete="current-password" required>
+    <button type="submit" class="primary wide">Unlock</button>
+    <p id="login-error" class="error" role="alert"></p>
+  </form>
+</div>
+
+<!-- Main app -->
+<div id="app" class="app" hidden>
+
+  <header class="bar">
+    <span class="brand">LangPal</span>
+    <span id="status" class="status" role="status">starting</span>
+    <button id="btn-voices" class="ghost" type="button">Voices</button>
+    <button id="btn-settings" class="ghost" type="button">Settings</button>
+  </header>
+
+  <main id="transcript" class="transcript" aria-live="polite" aria-label="Conversation"></main>
+
+  <!-- Input level, doubles as the "am I being heard" indicator -->
+  <div class="level-track" aria-hidden="true"><div id="level" class="level-fill"></div></div>
+
+  <footer class="controls">
+    <div class="row">
+      <button id="btn-mic" class="primary grow" type="button">Start listening</button>
+      <button id="btn-stop" class="danger" type="button" disabled title="Stop speaking and cancel queued audio">Stop</button>
+    </div>
+    <form id="text-form" class="row">
+      <input id="text-input" class="grow" type="text" placeholder="or type instead" autocomplete="off" enterkeyhint="send">
+      <button type="submit" class="ghost">Send</button>
+    </form>
+  </footer>
+
+</div>
+
+<!-- Settings -->
+<div id="settings" class="overlay" hidden>
+  <div class="panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="panel-head">
+      <h2 id="settings-title">Settings</h2>
+      <button id="settings-close" class="ghost" type="button" aria-label="Close">Done</button>
+    </div>
+    <div class="panel-body">
+
+      <h3>Endpoints</h3>
+      <p class="hint">Paste anything: <code>10.66.66.2:11435</code>, <code>http://host/v1</code> or a full
+      endpoint URL. It is normalised for you. A path prefix such as
+      <code>/upstream/omnivoice</code> is kept.</p>
+
+      <label for="s-llm-url">LLM base URL</label>
+      <input id="s-llm-url" data-setting="llm_url" type="text" inputmode="url" autocapitalize="off" spellcheck="false">
+      <label for="s-llm-model">LLM model</label>
+      <input id="s-llm-model" data-setting="llm_model" type="text" autocapitalize="off" spellcheck="false">
+
+      <label for="s-stt-url">STT base URL</label>
+      <input id="s-stt-url" data-setting="stt_url" type="text" inputmode="url" autocapitalize="off" spellcheck="false">
+      <label for="s-stt-model">STT model</label>
+      <input id="s-stt-model" data-setting="stt_model" type="text" autocapitalize="off" spellcheck="false">
+
+      <label for="s-tts-url">TTS base URL</label>
+      <input id="s-tts-url" data-setting="tts_url" type="text" inputmode="url" autocapitalize="off" spellcheck="false">
+      <label for="s-tts-model">TTS model</label>
+      <input id="s-tts-model" data-setting="tts_model" type="text" autocapitalize="off" spellcheck="false">
+
+      <div class="row">
+        <button id="btn-health" class="ghost" type="button">Test connection</button>
+        <span id="health-result" class="hint"></span>
+      </div>
+
+      <h3>Language</h3>
+      <p class="hint">One setting drives speech recognition and speech output. Pin a language
+      if you can &mdash; auto-detect is unreliable on short clips.</p>
+      <label for="s-language">Conversation language</label>
+      <input id="s-language" data-setting="language" list="language-list" type="text" autocapitalize="words" spellcheck="false">
+      <datalist id="language-list"></datalist>
+
+      <details>
+        <summary>Use different languages for input and output</summary>
+        <label for="s-stt-language">Recognise speech as (blank = follow the above)</label>
+        <input id="s-stt-language" data-setting="stt_language" list="language-list" type="text" autocapitalize="words" spellcheck="false">
+        <label for="s-tts-language">Speak replies in (blank = follow the above)</label>
+        <input id="s-tts-language" data-setting="tts_language" list="language-list" type="text" autocapitalize="words" spellcheck="false">
+      </details>
+
+      <h3>Voice</h3>
+      <label for="s-voice">Voice</label>
+      <select id="s-voice" data-setting="voice"></select>
+      <p class="hint">Manage the list under <strong>Voices</strong>.</p>
+
+      <label for="s-tts-seed">Voice seed</label>
+      <input id="s-tts-seed" data-setting="tts_seed" type="number" min="0" step="1" inputmode="numeric" placeholder="random each time">
+      <p class="hint">Fix this to get the same delivery for the same sentence every
+      time. Leave it blank for natural variation.</p>
+
+      <h3>Model behaviour</h3>
+      <label for="s-system-prompt">System prompt</label>
+      <textarea id="s-system-prompt" data-setting="system_prompt" rows="6"></textarea>
+
+      <label for="s-history">Context: messages of history to replay</label>
+      <input id="s-history" data-setting="history_messages" type="number" min="0" max="200" step="2" inputmode="numeric">
+
+      <p class="hint">Leave the next four blank to use whatever your inference server is
+      configured with.</p>
+      <div class="grid">
+        <div>
+          <label for="s-temperature">Temperature</label>
+          <input id="s-temperature" data-setting="temperature" type="number" min="0" max="2" step="0.05" inputmode="decimal" placeholder="server default">
+        </div>
+        <div>
+          <label for="s-top-p">Top-p</label>
+          <input id="s-top-p" data-setting="top_p" type="number" min="0" max="1" step="0.05" inputmode="decimal" placeholder="server default">
+        </div>
+        <div>
+          <label for="s-max-tokens">Max tokens</label>
+          <input id="s-max-tokens" data-setting="max_tokens" type="number" min="1" max="32768" step="1" inputmode="numeric" placeholder="server default">
+        </div>
+        <div>
+          <label for="s-seed">Seed</label>
+          <input id="s-seed" data-setting="seed" type="number" min="0" step="1" inputmode="numeric" placeholder="random">
+        </div>
+      </div>
+
+      <label for="s-reasoning">Reasoning effort</label>
+      <select id="s-reasoning" data-setting="reasoning_effort"></select>
+
+      <label for="s-thinking">Thinking blocks</label>
+      <select id="s-thinking" data-setting="enable_thinking">
+        <option value="">leave to the model's chat template</option>
+        <option value="true">force on</option>
+        <option value="false">force off</option>
+      </select>
+      <p class="hint">Any thinking the model emits is stripped before it is shown or spoken.</p>
+
+      <h3>Listening</h3>
+      <div class="grid">
+        <div>
+          <label for="s-silence">End of turn after (ms of silence)</label>
+          <input id="s-silence" data-local="silenceMs" type="number" min="200" max="5000" step="50" inputmode="numeric">
+        </div>
+        <div>
+          <label for="s-sensitivity">Mic sensitivity (1 = least)</label>
+          <input id="s-sensitivity" data-local="sensitivity" type="number" min="1" max="10" step="1" inputmode="numeric">
+        </div>
+      </div>
+      <label class="check"><input id="s-barge" data-local="bargeIn" type="checkbox"> Let me interrupt while it is speaking</label>
+      <label class="check"><input id="s-autosend" data-local="autoSend" type="checkbox"> Send as soon as I stop talking (off: put it in the text box to check first)</label>
+
+      <h3>Session</h3>
+      <div class="row">
+        <button id="btn-reset" class="ghost" type="button">Clear conversation</button>
+        <button id="btn-defaults" class="ghost" type="button">Reset settings to server defaults</button>
+      </div>
+      <p class="hint">Settings are stored in this browser only. Nothing is written to the
+      server's disk.</p>
+
+    </div>
+  </div>
+</div>
+
+<!-- Voices -->
+<div id="voices" class="overlay" hidden>
+  <div class="panel" role="dialog" aria-modal="true" aria-labelledby="voices-title">
+    <div class="panel-head">
+      <h2 id="voices-title">Voices</h2>
+      <button id="voices-close" class="ghost" type="button" aria-label="Close">Done</button>
+    </div>
+    <div class="panel-body">
+
+      <div class="row">
+        <button id="btn-refresh-voices" class="ghost" type="button">Refresh</button>
+        <span id="voices-status" class="hint"></span>
+      </div>
+      <ul id="voice-list" class="voice-list"></ul>
+
+      <h3>Add a voice</h3>
+      <p class="hint">Pick a clean clip of one person talking, roughly 5&ndash;20 seconds.
+      It is transcribed automatically; check the text before registering, because a wrong
+      transcript makes the clone worse.</p>
+
+      <label for="v-file">Audio file</label>
+      <input id="v-file" type="file" accept="audio/*">
+      <p id="v-file-info" class="hint"></p>
+
+      <label for="v-transcript">Transcript</label>
+      <textarea id="v-transcript" rows="4" disabled placeholder="transcribing&hellip; (double check)"></textarea>
+
+      <label for="v-name">Voice name</label>
+      <input id="v-name" type="text" autocapitalize="off" spellcheck="false" placeholder="letters, digits, . _ -">
+
+      <label class="check"><input id="v-replace" type="checkbox"> Replace an existing voice with this name</label>
+
+      <div class="row">
+        <button id="btn-register" class="primary" type="button" disabled>Register voice</button>
+        <span id="register-status" class="hint"></span>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

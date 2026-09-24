@@ -179,3 +179,23 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+
+
+# CUSTOM
+
+.prompt.md
+.env
+.env.local
+example-speak.py
+
+# LangPal: TLS keys and certificates must never be committed.
+*.pem
+*.key
+*.crt
+*.pfx
+
+# LangPal: voice reference clips are personal recordings. Delete these two
+# lines if you want to share a set of default voices with the repo.
+voices_default/*.wav
+voices_default/*.txt
