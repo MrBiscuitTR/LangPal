@@ -379,6 +379,9 @@ STT_TIMEOUT = 600
 TTS_TIMEOUT = 600
 VOICES_TIMEOUT = 600
 HEALTH_TIMEOUT = 10
+# Warming is fire-and-forget on a background thread, so this only has to be
+# long enough to outlast a cold model load rather than any user's patience.
+WARMUP_TIMEOUT = 600
 
 # How often to send an SSE comment while waiting on the LLM, so idle-socket
 # timeouts do not kill a slow first token.
@@ -1251,6 +1254,106 @@ def start_default_voice_bootstrap(directory: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Model warm-up
+# ---------------------------------------------------------------------------
+
+# One warm-up at a time. Without this, a user talking in short bursts would
+# pile up threads all asking for the same three models.
+_WARMING = threading.Lock()
+
+# A tenth of a second of silence, built once. Enough to make the STT endpoint a
+# real request -- which is what loads the model -- and small enough to cost
+# nothing. There is no transcript worth having and we do not read one.
+def _silent_wav(seconds=0.1, rate=16000):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(rate)
+        out.writeframes(b"\0\0" * int(rate * seconds))
+    return buf.getvalue()
+
+
+WARMUP_WAV = _silent_wav()
+
+# Shortest input that reliably produces audio. An empty string or bare
+# punctuation is rejected by some servers.
+WARMUP_TTS_TEXT = "ok"
+
+
+def _warm_llm(settings):
+    """One token, discarded. Loads the model the same way a real turn would."""
+    _request_json(
+        settings["llm_url"] + LLM_CHAT_PATH,
+        {
+            "model": settings["llm_model"],
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1,
+            "stream": False,
+        },
+        api_key=LLM_API_KEY, timeout=WARMUP_TIMEOUT)
+
+
+def _warm_stt(settings):
+    """Transcribe a tenth of a second of silence."""
+    body, content_type = _multipart_body(
+        {"model": settings["stt_model"], "response_format": "json"},
+        "file", "warmup.wav", WARMUP_WAV, "audio/wav")
+    resp = _upstream_request(
+        settings["stt_url"] + STT_TRANSCRIBE_PATH, data=body, method="POST",
+        headers={"Content-Type": content_type}, api_key=STT_API_KEY,
+        timeout=WARMUP_TIMEOUT)
+    try:
+        resp.read(1024)
+    finally:
+        resp.close()
+
+
+def _warm_tts(settings):
+    """Synthesise one short word and throw it away."""
+    _request_json(
+        settings["tts_url"] + TTS_SPEECH_PATH,
+        {
+            "model": settings["tts_model"],
+            "input": WARMUP_TTS_TEXT,
+            "language": "English",
+            "response_format": "wav",
+        },
+        api_key=TTS_API_KEY, timeout=WARMUP_TIMEOUT, raw=True)
+
+
+def warm_models(settings: dict) -> None:
+    """Load all three models by making a minimal real request to each.
+
+    A health check will not do it. llama-swap answers /health itself without
+    starting anything, and against genuinely unloaded models that returned 200
+    and loaded nothing -- a false positive that only shows up if you check the
+    model's state afterwards rather than the HTTP status.
+
+    Requests go out in parallel, so a cold start costs the slowest load rather
+    than the sum of all three. Every failure is swallowed: warming is an
+    optimisation, and losing it only restores the on-demand timing.
+    """
+    if not _WARMING.acquire(blocking=False):
+        return                                 # one is already running
+    try:
+        threads = []
+        for name, warm in (("llm", _warm_llm), ("stt", _warm_stt), ("tts", _warm_tts)):
+            def run(warm=warm, name=name):
+                try:
+                    warm(settings)
+                except (UpstreamError, BadRequest, OSError):
+                    pass                       # never user-visible
+            thread = threading.Thread(target=run, name="warmup-" + name, daemon=True)
+            thread.start()
+            threads.append(thread)
+        for thread in threads:
+            thread.join(WARMUP_TIMEOUT)
+    finally:
+        _WARMING.release()
+
+
+# ---------------------------------------------------------------------------
 # LLM streaming
 # ---------------------------------------------------------------------------
 
@@ -1601,6 +1704,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST":
                 route = {
                     "/api/health": self._handle_health,
+                    "/api/warmup": self._handle_warmup,
                     "/api/stt": self._handle_stt,
                     "/api/chat": self._handle_chat,
                     "/api/tts": self._handle_tts,
@@ -1701,6 +1805,16 @@ class Handler(BaseHTTPRequestHandler):
             except UpstreamError as exc:
                 results[name] = {"ok": False, "error": str(exc)[:MAX_ERROR_ECHO_CHARS]}
         return self._send_json(200, {"checks": results})
+
+    def _handle_warmup(self):
+        """Start loading the models, and answer without waiting for them."""
+        body = self._read_json()
+        settings = validate_settings(body.get("settings"))
+        # Returning immediately is the whole point: the browser fires this
+        # mid-sentence and must not be held up by a cold load.
+        threading.Thread(target=warm_models, args=(settings,),
+                         name="warmup", daemon=True).start()
+        return self._send_json(200, {"ok": True})
 
     def _handle_stt(self):
         """Transcribe one clip -- either a spoken turn or a voice sample."""

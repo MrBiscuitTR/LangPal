@@ -13,6 +13,7 @@ import io
 import json
 import os
 import sys
+import threading
 import unittest
 import wave
 
@@ -833,6 +834,106 @@ class TurnCancellation(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(langpal.BadRequest):
                     handler._turn_id({"turn": bad})
+
+
+class ModelWarmUp(unittest.TestCase):
+    """Loading the models while the user is still talking."""
+
+    def setUp(self):
+        self.settings = langpal.validate_settings({
+            "llm_url": "http://box:11435", "llm_model": "gemma4-26b-a4b",
+            "stt_url": "http://box:11435", "stt_model": "qwen3-asr",
+            "tts_url": "http://box:11435/upstream/omnivoice", "tts_model": "omnivoice",
+        })
+        self.calls = []
+        self.lock = threading.Lock()
+        real = langpal._upstream_request
+
+        def fake(url, **kwargs):
+            with self.lock:
+                self.calls.append(url)
+            raise langpal.UpstreamError("not reachable in tests")
+
+        langpal._upstream_request = fake
+        self.addCleanup(setattr, langpal, "_upstream_request", real)
+
+    def urls(self):
+        with self.lock:
+            return sorted(self.calls)
+
+    def test_each_model_gets_a_real_request(self):
+        """A health check does not load anything; a real request does.
+
+        llama-swap answers /health itself without starting a backend. Measured
+        against genuinely unloaded models, `/health?model=...` returned 200 and
+        loaded nothing -- a false positive invisible unless you check the
+        model's state rather than the HTTP status afterwards.
+        """
+        langpal.warm_models(self.settings)
+        self.assertEqual(self.urls(), [
+            "http://box:11435/upstream/omnivoice/v1/audio/speech",
+            "http://box:11435/v1/audio/transcriptions",
+            "http://box:11435/v1/chat/completions",
+        ])
+
+    def test_no_health_endpoint_is_used_for_warming(self):
+        langpal.warm_models(self.settings)
+        for url in self.urls():
+            self.assertNotIn(langpal.HEALTH_PATH + "?", url)
+            self.assertFalse(url.endswith(langpal.HEALTH_PATH),
+                             "a health check will not load a model")
+
+    def test_one_failure_does_not_skip_the_others(self):
+        langpal.warm_models(self.settings)      # every call raises
+        self.assertEqual(len(self.urls()), 3)
+
+    def test_the_warm_up_request_is_minimal(self):
+        """It should cost a token, not a turn."""
+        captured = {}
+        real = langpal._request_json
+
+        def fake(url, payload, **kwargs):
+            captured[url] = payload
+            raise langpal.UpstreamError("stop here")
+
+        langpal._request_json = fake
+        self.addCleanup(setattr, langpal, "_request_json", real)
+        try:
+            langpal._warm_llm(self.settings)
+        except langpal.UpstreamError:
+            pass
+        body = captured["http://box:11435/v1/chat/completions"]
+        self.assertEqual(body["max_tokens"], 1)
+        self.assertFalse(body["stream"])
+        self.assertEqual(len(body["messages"]), 1)
+
+    def test_the_warm_up_clip_is_tiny_but_valid(self):
+        seconds = langpal.inspect_wav(langpal.WARMUP_WAV, max_seconds=5)
+        self.assertLessEqual(seconds, 0.5)
+        self.assertLess(len(langpal.WARMUP_WAV), 10000)
+
+    def test_only_one_warm_up_runs_at_a_time(self):
+        """Someone talking in bursts would otherwise pile up threads."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking(url, **kwargs):
+            with self.lock:
+                self.calls.append(url)
+            started.set()
+            release.wait(5)
+            raise langpal.UpstreamError("done")
+
+        langpal._upstream_request = blocking
+        first = threading.Thread(target=langpal.warm_models, args=(self.settings,))
+        first.start()
+        self.assertTrue(started.wait(5))
+
+        langpal.warm_models(self.settings)      # must return at once, doing nothing
+        release.set()
+        first.join(10)
+        # The first warm-up issues three; the second must add none of its own.
+        self.assertLessEqual(len(self.urls()), 3)
 
 
 class TurnLengthLimits(unittest.TestCase):

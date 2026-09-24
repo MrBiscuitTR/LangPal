@@ -79,6 +79,13 @@ const ECHO_WINDOW_S = 0.06;
 // gaps between its words -- so a person talking steadily is detected in
 // bursts, with the assistant's own syllables masking them in between.
 const BARGE_HOLD_MS = 600;
+
+// Once someone has been speaking this long, all three models are certainly
+// about to be wanted, so start loading them now rather than after the
+// sentence ends. The cooldown stops short bursts re-asking constantly; the
+// models stay resident far longer than this anyway.
+const WARMUP_AFTER_MS = 1000;
+const WARMUP_COOLDOWN_MS = 30000;
 const BARGE_GRACE_MS = 300;       // deaf at the start of a sentence, while
                                   // the echo floor is still converging. Short
                                   // because the floor is peak-held and so
@@ -97,6 +104,7 @@ const DEFAULT_LOCAL = {
   maxTurnSeconds: 150,            // hard stop for one turn; see the note above
   sensitivity: 5,                 // 1 (least) .. 10 (most)
   bargeIn: true,                  // allow interrupting the assistant
+  preloadModels: true,            // start loading models while still talking
   autoSend: true,                 // send as soon as the turn ends
 };
 
@@ -124,6 +132,7 @@ const state = {
   stopPending: null,      // promise for an in-progress /api/stop
   chatController: null,
   turnId: null,           // identifies the reply being produced, for Stop
+  warmupAt: 0,            // last time the models were asked to load
   aborters: new Set(),    // every in-flight fetch Stop should cancel
   generation: 0,          // bumped by Stop; a turn from an older one is dropped
   detectedLanguage: '',
@@ -149,6 +158,7 @@ const vad = {
   chunks: [],
   totalSamples: 0,
   seededSamples: 0,       // how much of chunks came from the pre-roll, not speech
+  warmed: false,          // models already asked for during this utterance
   preroll: [],
   prerollSamples: 0,
   loudSamples: 0,         // consecutive loud samples while idle
@@ -494,6 +504,7 @@ function resetVad() {
   vad.quietSamples = 0;
   vad.speechSince = 0;
   vad.lastLoudAt = 0;
+  vad.warmed = false;
 }
 
 // Populated only while the settings panel is open, and throttled: this is a
@@ -629,6 +640,14 @@ function onFrame(frame) {
   vad.totalSamples += samples.length;
   vad.quietSamples = loud ? 0 : vad.quietSamples + samples.length;
 
+  // Measured on the speech itself, not the clip, so the pre-roll does not
+  // count towards it -- the point is a second of someone actually talking.
+  if (!vad.warmed &&
+      vad.totalSamples - vad.seededSamples >= msToSamples(WARMUP_AFTER_MS, rate)) {
+    vad.warmed = true;
+    warmModels();
+  }
+
   if (vad.quietSamples >= msToSamples(state.local.silenceMs, rate)) {
     endUtterance(false);
   } else if (vad.totalSamples - vad.seededSamples >= msToSamples(maxTurnMs(), rate)) {
@@ -636,6 +655,16 @@ function onFrame(frame) {
     // of lead-in and should not count against what the user said.
     endUtterance(true);
   }
+}
+
+// Fire-and-forget. Nothing waits on the result and a failure changes
+// nothing: the models would simply load on demand, as they used to.
+function warmModels() {
+  if (!state.local.preloadModels) return;
+  const now = Date.now();
+  if (now - state.warmupAt < WARMUP_COOLDOWN_MS) return;
+  state.warmupAt = now;
+  api('/api/warmup', { settings: settingsForRequest() }).catch(() => {});
 }
 
 function beginUtterance() {

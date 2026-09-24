@@ -166,6 +166,7 @@ Stored in `localStorage`, never sent to the server.
 | Mic sensitivity | 5 | 1–10; higher lowers the threshold |
 | Longest single turn | 150 s | 15–240; see below |
 | Let me interrupt | on | off = microphone muted while the reply plays |
+| Start loading the models early | on | see below |
 | Send automatically | on | off = the turn is captured but not sent |
 
 Fixed tuning constants live at the top of `web/app.js`: `SPEECH_START_MS`
@@ -179,6 +180,46 @@ Fixed tuning constants live at the top of `web/app.js`: `SPEECH_START_MS`
 The pre-roll ring has to reach back to the moment speech might have started,
 which is the longer of the two start windows. Hard-coding it would mean raising
 `BARGE_START_MS` silently truncated every interruption.
+
+### Loading the models early
+
+A cold llama-swap spends up to a minute loading a model before it answers, and
+that minute lands between you finishing a sentence and hearing anything back.
+
+By the time someone has been speaking for `WARMUP_AFTER_MS`, all three models
+are certainly about to be wanted, so LangPal asks for them then — in parallel
+with the rest of the sentence rather than after it. On a warm stack it changes
+nothing; on a cold one it hides most of the load behind speech you were going
+to produce anyway.
+
+Each model gets a **minimal real request** — one token from the LLM, a tenth of
+a second of silence to the ASR, one short word to the TTS — and the results are
+thrown away. Trivial to serve, and it works on any OpenAI-compatible server
+rather than only llama-swap.
+
+A health check will *not* do it, which is worth recording because it looks like
+it should. llama-swap documents `/upstream/<model>/health` as a warm-up
+trigger, and that does work, but it only applies to llama-swap and cannot be
+built from a base URL that already contains an `/upstream` prefix — which is
+the recommended TTS setting. The query-parameter form `{base}/health?model=X`
+does not work at all: `/health` is llama-swap's own endpoint, it answers that
+itself, and the parameter is ignored. Measured from cold it returned `200` and
+loaded nothing:
+
+```
+GET /health?model=gemma4-26b-a4b       -> 200, still unloaded
+GET /upstream/gemma4-26b-a4b/health    -> 200, loaded
+POST /v1/chat/completions (1 token)    -> 200, loaded
+```
+
+The three requests go out in parallel, so a cold start costs the slowest load
+rather than the sum. It is fire-and-forget: `/api/warmup` starts a background
+thread and returns immediately, a failure is never surfaced, and one warm-up
+runs at a time so talking in bursts cannot pile up threads. Measured from fully
+unloaded, all three are resident within five seconds.
+
+Turn it off to load models strictly on demand. A `WARMUP_COOLDOWN_MS` window
+stops repeated requests; models stay resident far longer than that anyway.
 
 ### How long a turn can be
 

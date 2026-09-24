@@ -100,6 +100,27 @@ Always `200`; look at each `ok`. 10 s timeout per endpoint.
 
 ---
 
+## `POST /api/warmup`
+
+```json
+{ "settings": {} }
+```
+
+Sends each configured backend a minimal real request — one token from the LLM,
+a tenth of a second of silence to the ASR, one short word to the TTS — and
+discards the results. That loads the model on any OpenAI-compatible server; a
+health check does not (see
+[configuration.md](configuration.md#loading-the-models-early)).
+
+Returns `{"ok": true}` immediately — the work happens on a background thread, in
+parallel — so the browser can fire this mid-sentence without being held up by a
+cold load. Failures are swallowed; warming is an optimisation, and losing it
+only restores the on-demand timing.
+
+One warm-up runs at a time per process.
+
+---
+
 ## `POST /api/stt`
 
 ```json
