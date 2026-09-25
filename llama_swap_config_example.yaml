@@ -1,0 +1,57 @@
+# vocal agents models
+
+## MoE model gemma4 26b a4b to have very little latency, use something smaller (preferably fitting entirely in your vram) if you have less ram/vram. Note that you can use '-ngl 0' to load the mdeol entirely in your ram if your vram is very limited, but that will be VERY slow, and wont feel interactive at all. or maybe just use a different endpoint for the LLM especially. consider free MoE models on Openrouter perhaps.
+"gemma4-26b-a4b":
+  cmd: >-
+    llama-server
+    --model "C:\Users\cagan\.cache\gguf\testing\Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf"
+    --host 127.0.0.1
+    --port ${PORT}
+    -ngl all
+    -fa on
+    -ctk q4_0
+    -ctv q4_0
+    -c 40000
+    --parallel 1
+    --jinja
+    --reasoning off
+  proxy: "http://127.0.0.1:${PORT}"
+  ttl: 600
+  cmdStop: taskkill /F /T /PID ${PID}
+
+
+# your speech-to-text model, for speech recognition. you can use any other openai compatible endpoint here, but this is a good one to use with the vocal agent.
+"qwen3-asr":
+  cmd: >-
+    llama-server
+    --model "C:\Users\cagan\.cache\gguf\STT\Qwen3-ASR-1.7B-Q8_0.gguf"
+    --mmproj "C:\Users\cagan\.cache\gguf\STT\mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"
+    --host 127.0.0.1
+    --port ${PORT}
+    -ngl 99
+    -fa on
+    -c 8192
+    --threads 16
+    --parallel 1
+  proxy: "http://127.0.0.1:${PORT}"
+  ttl: 600
+  cmdStop: taskkill /F /T /PID ${PID}
+
+
+# Text-to-Speech (TTS) models require a seperate runtime. whatever yours is, and wherever it runs, add its command line here, and its endpoint as the 'proxy' it must be openai compatible in order to work with llama-swap like this.
+"omnivoice":
+  cmd: docker compose -f "C:\Users\cagan\Desktop\Dev\Docker\Omnivoice TTS\omnivoice-docker\docker-compose.yml" up
+  proxy: "http://127.0.0.1:8123"
+  ttl: 0
+  checkEndpoint: "/health"
+  cmdStop: taskkill /F /T /PID ${PID}
+
+
+groups:
+  "vocal-agent":
+    swap: false        # members stay resident together. the key line.
+    exclusive: true    # unloads other models as these load
+    members:
+      - "gemma4-26b-a4b"
+      - "qwen3-asr"
+      - "omnivoice"
