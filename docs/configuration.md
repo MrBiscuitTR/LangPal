@@ -113,6 +113,43 @@ Set from the browser, validated on the server.
 | `max_tokens` | 1–32768 | same |
 | `seed` | 0–2³¹−1 | same (output varies run to run) |
 | `history_messages` | 0–200 | falls back to `LANGPAL_HISTORY_MESSAGES` |
+
+### Context: how history is kept
+
+`history_messages` is a **floor**, not an exact count, and there is a second,
+harder limit on top of it.
+
+**The token budget.** A message count cannot keep a conversation inside the
+model's context window — twenty long turns overflow a 40k window and
+llama-server refuses the whole request with
+`exceed_context_size_error`. History is therefore also trimmed to a token
+budget, oldest exchanges dropped first, so a conversation can run indefinitely.
+
+The budget is *discovered*, not configured. That error names both the prompt
+size and the real context size, so the first overflow teaches LangPal the
+window for that model; it trims and retries immediately, and every later turn
+is trimmed in advance. Set `LANGPAL_CONTEXT_TOKENS` only to give a better
+starting guess before anything is learned.
+
+**Why the window is anchored.** llama.cpp reuses its KV cache when a prompt
+shares a prefix with the last one, so a turn that only appends costs almost
+nothing to prepare. Measured on a 55k-token conversation:
+
+| Prompt | Time to first token |
+| --- | --- |
+| Same prefix, one turn appended | 0.36 s |
+| Prefix shifted by two messages | 8.49 s |
+
+Taking `history[-limit:]` every turn slides the window forward by one exchange
+each time, changing the prefix and paying that cost on **every turn**. So the
+start of the replayed history is remembered instead, and only moves when the
+window outgrows `HISTORY_SLACK` × `history_messages`, or no longer fits the
+budget — and then it jumps well back, buying dozens of turns before the next
+move. Over 400 simulated turns that is 35 reprocesses instead of 389.
+
+The same reasoning sets `TRIM_TARGET_RATIO`: when a trim is needed it cuts back
+to 60% of the budget rather than just far enough to fit, which would put the
+conversation back over the line on the very next turn.
 | `reasoning_effort` | `""`, `none`, `low`, `medium`, `high` | field omitted |
 | `enable_thinking` | unset / true / false | the chat template decides |
 

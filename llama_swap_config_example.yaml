@@ -1,57 +1,113 @@
+
+# example config. this is what i (the author) used, but you can change it freely, with the help of the official documentation, or by asking any sufficiently advanced LLM. the only requirement is that the models you use are openai compatible, and that they are running on a server somewhere that you can reach. if you want to run them locally, you can use llama-server, or any other openai compatible server.
+
+healthCheckTimeout: 120
+models:
+
 # vocal agents models
 
 ## MoE model gemma4 26b a4b to have very little latency, use something smaller (preferably fitting entirely in your vram) if you have less ram/vram. Note that you can use '-ngl 0' to load the mdeol entirely in your ram if your vram is very limited, but that will be VERY slow, and wont feel interactive at all. or maybe just use a different endpoint for the LLM especially. consider free MoE models on Openrouter perhaps.
-"gemma4-26b-a4b":
-  cmd: >-
-    llama-server
-    --model "C:\Users\cagan\.cache\gguf\testing\Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf"
-    --host 127.0.0.1
-    --port ${PORT}
-    -ngl all
-    -fa on
-    -ctk q4_0
-    -ctv q4_0
-    -c 40000
-    --parallel 1
-    --jinja
-    --reasoning off
-  proxy: "http://127.0.0.1:${PORT}"
-  ttl: 600
-  cmdStop: taskkill /F /T /PID ${PID}
+  "gemma4-26b-a4b":
+    cmd: >-
+      llama-server
+      --model "C:\Users\cagan\.cache\gguf\testing\Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-Q4_K_M.gguf"
+      --host 127.0.0.1
+      --port ${PORT}
+      -ngl all
+      -fa on
+      -ctk q4_0
+      -ctv q4_0
+      -c 32000
+      --parallel 1
+      --jinja
+      --reasoning off
+      --cache-reuse 256
+    proxy: "http://127.0.0.1:${PORT}"
+    # ttl 0 = never unload. Worth it if the VRAM is free: with a ttl, the first
+    # turn after an idle gap pays the whole model load. LangPal warms the models
+    # a second into your speech, which hides most of that, but not all of it.
+    ttl: 0
+    cmdStop: taskkill /F /T /PID ${PID}
 
 
-# your speech-to-text model, for speech recognition. you can use any other openai compatible endpoint here, but this is a good one to use with the vocal agent.
-"qwen3-asr":
-  cmd: >-
-    llama-server
-    --model "C:\Users\cagan\.cache\gguf\STT\Qwen3-ASR-1.7B-Q8_0.gguf"
-    --mmproj "C:\Users\cagan\.cache\gguf\STT\mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"
-    --host 127.0.0.1
-    --port ${PORT}
-    -ngl 99
-    -fa on
-    -c 8192
-    --threads 16
-    --parallel 1
-  proxy: "http://127.0.0.1:${PORT}"
-  ttl: 600
-  cmdStop: taskkill /F /T /PID ${PID}
+  # your speech-to-text model, for speech recognition. you can use any other openai compatible endpoint here, but this is a good one to use with the vocal agent.
+  "qwen3-asr":
+    cmd: >-
+      llama-server
+      --model "C:\Users\cagan\.cache\gguf\STT\Qwen3-ASR-1.7B-Q8_0.gguf"
+      --mmproj "C:\Users\cagan\.cache\gguf\STT\mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"
+      --host 127.0.0.1
+      --port ${PORT}
+      -ngl 99
+      -fa on
+      -c 8192
+      --threads 16
+      --parallel 1
+    proxy: "http://127.0.0.1:${PORT}"
+    ttl: 0
+    cmdStop: taskkill /F /T /PID ${PID}
+    # -c 8192 comfortably covers LangPal's longest turn: a 240 s clip transcribes well inside this. Do not lower it below ~6000 if you raise the turn limit.
 
 
-# Text-to-Speech (TTS) models require a seperate runtime. whatever yours is, and wherever it runs, add its command line here, and its endpoint as the 'proxy' it must be openai compatible in order to work with llama-swap like this.
-"omnivoice":
-  cmd: docker compose -f "C:\Users\cagan\Desktop\Dev\Docker\Omnivoice TTS\omnivoice-docker\docker-compose.yml" up
-  proxy: "http://127.0.0.1:8123"
-  ttl: 0
-  checkEndpoint: "/health"
-  cmdStop: taskkill /F /T /PID ${PID}
+  # Text-to-Speech (TTS) models require a seperate runtime. whatever yours is, and wherever it runs, add its command line here, and its endpoint as the 'proxy' it must be openai compatible in order to work with llama-swap like this.
+  "omnivoice":
+    cmd: docker compose -f "C:\Users\cagan\Desktop\Dev\Docker\Omnivoice TTS\omnivoice-docker\docker-compose.yml" up
+    proxy: "http://127.0.0.1:8123"
+    ttl: 0
+    checkEndpoint: "/health"
+    cmdStop: taskkill /F /T /PID ${PID}
+
+
+# Load the whole group when llama-swap starts, so the very first conversation
+# is as fast as the tenth. Without this the first turn of the day waits for
+# three model loads. experimental, causes issues. i dont recommend uncommenting this unless you know what you are doing.
+# hooks:
+#   on_startup:
+#     preload:
+#       - "gemma4-26b-a4b"
+#       - "qwen3-asr"
+#       - "omnivoice"
 
 
 groups:
+# good group for any vocal agent that needs speed : a fast moe model, TTS and STT. (eg. langpal)
   "vocal-agent":
-    swap: false        # members stay resident together. the key line.
-    exclusive: true    # unloads other models as these load
+    swap: false        # members stay resident together — the key line
+    exclusive: true    # unloads flux when you're doing RAG
     members:
       - "gemma4-26b-a4b"
       - "qwen3-asr"
       - "omnivoice"
+
+# ---------------------------------------------------------------------------
+# Notes on the flags above, measured against this stack
+# ---------------------------------------------------------------------------
+#
+# --cache-reuse 256
+#   llama.cpp keeps the KV cache for a matching prompt prefix, so an ordinary
+#   turn -- which only appends to the conversation -- is nearly free to
+#   prepare. Measured here on a 55k-token conversation: 0.36 s with the cache
+#   against 8.49 s without.
+#
+#   LangPal is built around that: it anchors the replayed history so the prompt
+#   only ever grows, and when the conversation finally outgrows the context it
+#   drops a large block at once rather than one exchange per turn. That still
+#   leaves a handful of turns where the prefix changes. --cache-reuse lets
+#   llama.cpp shift the KV cache instead of reprocessing on exactly those
+#   turns. Untested here, since it needs a server restart to A/B, but the
+#   mechanism matches the cost precisely.
+#
+# -ctk q4_0 / -ctv q4_0
+#   Quantised KV cache. Buys context per gigabyte of VRAM at a small quality
+#   cost. Drop to q8_0, or remove entirely, if you have the VRAM -- 40k tokens
+#   is a very long conversation for language practice.
+#
+# --parallel 1
+#   Correct for a single speaker. Raising it splits the context between slots.
+#
+# What NOT to rely on:
+#   --context-shift sounds like the answer to a conversation outgrowing the
+#   window, but it applies during generation, not to an oversized prompt. A
+#   prompt larger than -c is still refused outright. LangPal handles that
+#   itself by trimming oldest-first, and learns your real context size from the
+#   server's error the first time it happens.

@@ -383,6 +383,203 @@ class ChatPayload(unittest.TestCase):
             [{"role": "user", "content": "hi"}], settings))
 
 
+class ContextTrimming(unittest.TestCase):
+    """History must never outgrow the model's context window."""
+
+    def setUp(self):
+        self.settings = langpal.validate_settings(
+            {"llm_url": "http://box:11435", "llm_model": "m", "history_messages": 200})
+        langpal._CONTEXT_LIMITS.clear()
+        self.addCleanup(langpal._CONTEXT_LIMITS.clear)
+
+    def big_session(self, pairs=60, words=400):
+        session = langpal.Session("s")
+        for i in range(pairs):
+            session.history.append({"role": "user", "content": "u%d " % i + "word " * words})
+            session.history.append({"role": "assistant", "content": "a%d " % i + "word " * words})
+        return session
+
+    def test_estimate_scales_with_length(self):
+        short = langpal.estimate_tokens([{"role": "user", "content": "hi"}])
+        long = langpal.estimate_tokens([{"role": "user", "content": "x" * 3000}])
+        self.assertGreater(long, short * 10)
+
+    def test_a_long_conversation_is_trimmed_to_fit(self):
+        messages = langpal.build_messages(self.big_session(), "newest", self.settings)
+        self.assertLessEqual(langpal.estimate_tokens(messages),
+                             langpal.context_budget(self.settings))
+
+    def test_the_system_prompt_and_newest_turn_always_survive(self):
+        messages = langpal.build_messages(self.big_session(), "newest", self.settings)
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[-1], {"role": "user", "content": "newest"})
+
+    def test_the_oldest_go_first(self):
+        """FIFO: recent context is what a conversation actually needs."""
+        messages = langpal.build_messages(self.big_session(), "newest", self.settings)
+        kept = [m["content"][:4] for m in messages[1:-1]]
+        self.assertTrue(kept, "some history should survive")
+        # Whatever is kept must be a contiguous run ending at the newest pair.
+        self.assertIn("a59", kept[-1])
+
+    def test_history_starts_on_a_user_turn(self):
+        """Dropping in pairs keeps the replay from opening mid-exchange."""
+        messages = langpal.build_messages(self.big_session(), "newest", self.settings)
+        history = messages[1:-1]
+        if history:
+            self.assertEqual(history[0]["role"], "user")
+
+    def test_a_short_conversation_is_left_alone(self):
+        session = langpal.Session("s")
+        session.history = [{"role": "user", "content": "hello"},
+                           {"role": "assistant", "content": "hi there"}]
+        messages = langpal.build_messages(session, "how are you", self.settings)
+        self.assertEqual(len(messages), 4)
+
+    def test_an_unshrinkable_prompt_is_returned_as_is(self):
+        """One enormous turn cannot be trimmed; that is the caller's problem."""
+        messages = [{"role": "system", "content": "s"},
+                    {"role": "user", "content": "x" * 500000}]
+        self.assertEqual(langpal.trim_to_budget(messages, 100), messages)
+
+    def test_budget_leaves_room_for_the_reply(self):
+        langpal.remember_context_limit(self.settings, 40192)
+        self.assertLess(langpal.context_budget(self.settings), 40192)
+        roomy = dict(self.settings, max_tokens=8000)
+        self.assertLess(langpal.context_budget(roomy),
+                        langpal.context_budget(self.settings))
+
+    def test_the_limit_is_learned_from_the_error(self):
+        before = langpal.context_budget(self.settings)
+        langpal.remember_context_limit(self.settings, 40192)
+        self.assertGreater(langpal.context_budget(self.settings), before)
+
+    def test_overflow_errors_are_recognised(self):
+        real = ('HTTP 400 from http://box/v1/chat/completions: {"error":{"code":400,'
+                '"message":"request (60019 tokens) exceeds the available context size '
+                '(40192 tokens), try increasing it","type":"exceed_context_size_error",'
+                '"n_prompt_tokens":60019,"n_ctx":40192}}')
+        self.assertEqual(langpal.parse_context_overflow(real), 40192)
+
+    def test_overflow_without_a_number_still_converges(self):
+        self.assertEqual(
+            langpal.parse_context_overflow("prompt is too many tokens for this model"), -1)
+
+    def test_unrelated_errors_are_not_mistaken_for_overflow(self):
+        for message in ("HTTP 500: internal error", "cannot reach host", ""):
+            with self.subTest(message=message):
+                self.assertIsNone(langpal.parse_context_overflow(message))
+
+
+class PromptPrefixStability(unittest.TestCase):
+    """Each turn's prompt must extend the last one, not slide along it.
+
+    llama.cpp reuses the KV cache for a matching prompt prefix. Measured on a
+    55k-token conversation, a turn that only appends took 0.36 s to prepare and
+    one that shifted the window took 8.49 s. `history[-limit:]` shifts it every
+    single turn, so this is the difference between a conversation that stays
+    responsive and one that degrades into multi-second pauses.
+    """
+
+    def setUp(self):
+        langpal._CONTEXT_LIMITS.clear()
+        self.addCleanup(langpal._CONTEXT_LIMITS.clear)
+
+    def settings(self, history=20):
+        s = langpal.validate_settings(
+            {"llm_url": "http://box:1", "llm_model": "m", "history_messages": history})
+        langpal.remember_context_limit(s, 40192)
+        return s
+
+    def run_turns(self, settings, turns=120, words=60):
+        """Return how many turns failed to extend the previous prompt."""
+        session = langpal.Session("s")
+        previous = None
+        misses = 0
+        for i in range(turns):
+            messages = langpal.build_messages(session, "q%d" % i, settings)
+            reusable = [m["content"] for m in messages[:-1]]
+            if previous is not None and reusable[:len(previous)] != previous:
+                misses += 1
+            previous = reusable
+            session.record_turn("u%d " % i + "word " * words,
+                                "a%d " % i + "word " * words)
+        return misses
+
+    def test_most_turns_reuse_the_prefix(self):
+        misses = self.run_turns(self.settings())
+        self.assertLess(misses, 20,
+                        "the window is sliding; every turn costs a full reprocess")
+
+    def test_a_sliding_window_would_fail_this(self):
+        """Guards the test itself: the old behaviour must not pass."""
+        session = langpal.Session("s")
+        settings = self.settings()
+        previous = None
+        misses = 0
+        for i in range(60):
+            messages = ([{"role": "system", "content": settings["system_prompt"]}]
+                        + session.history[-settings["history_messages"]:]
+                        + [{"role": "user", "content": "q%d" % i}])
+            reusable = [m["content"] for m in messages[:-1]]
+            if previous is not None and reusable[:len(previous)] != previous:
+                misses += 1
+            previous = reusable
+            session.record_turn("u%d" % i, "a%d" % i)
+        self.assertGreater(misses, 30, "sliding should miss on most turns")
+
+    def test_the_anchor_only_moves_forward(self):
+        session = langpal.Session("s")
+        settings = self.settings()
+        seen = 0
+        for i in range(80):
+            langpal.build_messages(session, "q", settings)
+            self.assertGreaterEqual(session.history_start, seen)
+            seen = session.history_start
+            session.record_turn("u" * 100, "a" * 100)
+
+    def test_the_anchor_moves_when_the_window_outgrows_its_slack(self):
+        session = langpal.Session("s")
+        settings = self.settings(history=10)
+        for _ in range(40):
+            langpal.build_messages(session, "q", settings)
+            session.record_turn("u", "a")
+        replayed = len(langpal.build_messages(session, "q", settings)) - 2
+        self.assertLessEqual(replayed, 10 * langpal.HISTORY_SLACK)
+
+    def test_the_anchor_moves_when_tokens_run_out(self):
+        session = langpal.Session("s")
+        settings = self.settings(history=200)
+        for _ in range(80):
+            langpal.build_messages(session, "q", settings)
+            session.record_turn("word " * 1500, "word " * 1500)
+        messages = langpal.build_messages(session, "q", settings)
+        self.assertLessEqual(langpal.estimate_tokens(messages),
+                             langpal.context_budget(settings))
+        self.assertGreater(session.history_start, 0)
+
+    def test_trimming_stored_history_moves_the_anchor_with_it(self):
+        """The anchor is an index; deleting from the front invalidates it."""
+        session = langpal.Session("s")
+        for _ in range(langpal.MAX_HISTORY_MESSAGES + 20):
+            session.record_turn("u", "a")
+        session.history_start = 10
+        before = session.history[session.history_start]
+        session.record_turn("newest-u", "newest-a")
+        self.assertIs(session.history[session.history_start], before)
+
+    def test_the_window_opens_on_a_user_turn(self):
+        session = langpal.Session("s")
+        settings = self.settings(history=4)
+        for _ in range(30):
+            langpal.build_messages(session, "q", settings)
+            session.record_turn("u", "a")
+        messages = langpal.build_messages(session, "q", settings)
+        history = messages[1:-1]
+        if history:
+            self.assertEqual(history[0]["role"], "user")
+
+
 class BuildMessages(unittest.TestCase):
     def setUp(self):
         self.session = langpal.Session("sid")

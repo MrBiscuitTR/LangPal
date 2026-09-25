@@ -268,6 +268,48 @@ DEFAULT_SYSTEM_PROMPT = _env("LANGPAL_SYSTEM_PROMPT") or (
 DEFAULT_HISTORY_MESSAGES = _env_int("LANGPAL_HISTORY_MESSAGES", 20)
 MAX_HISTORY_MESSAGES = 200
 
+# A message count alone cannot keep a conversation inside the model's
+# context: twenty long turns overflow a 40k window and the server rejects the
+# whole request. So history is also trimmed to a token budget, oldest first.
+#
+# Tokens are estimated from character count because counting them properly
+# would mean a round trip to /tokenize per turn. The estimate only has to be
+# close: an overflow is caught and retried, so being wrong costs one extra
+# request rather than a failed turn. Deliberately low, since languages other
+# than English pack fewer characters per token.
+CHARS_PER_TOKEN = 3.0
+# Rough per-message cost of the chat template's role markers and separators.
+TOKENS_PER_MESSAGE = 4
+
+# Left free for the reply when max_tokens is unset, plus slack for the
+# estimate being wrong in the wrong direction.
+GENERATION_RESERVE_TOKENS = 1024
+CONTEXT_SAFETY_TOKENS = 256
+
+# When a trim is needed, cut back to this fraction of the budget rather than
+# just far enough to fit.
+#
+# This is a latency decision, not a memory one. llama.cpp keeps the KV cache
+# for a matching prompt prefix, so an ordinary turn -- which only appends --
+# costs almost nothing to prepare. Dropping anything from the front changes the
+# prefix and forces the whole prompt to be reprocessed: measured on a 55k-token
+# conversation, 0.36 s became 8.49 s.
+#
+# Trimming to exactly the budget would mean crossing it again on the very next
+# turn, and paying that on every turn from then on. Cutting well below it
+# instead buys dozens of turns before the next one.
+TRIM_TARGET_RATIO = 0.6
+
+# The count-based window works the same way: let it grow to this multiple of
+# history_messages before cutting it back, so the start of the prompt holds
+# still in between. history_messages is therefore a floor on how much context
+# is replayed, not an exact figure.
+HISTORY_SLACK = 2
+
+# Used until the real one is learned from an overflow. Low enough to be safe
+# on a small server, high enough not to throw away a normal conversation.
+ASSUMED_CONTEXT_TOKENS = _env_int("LANGPAL_CONTEXT_TOKENS", 8192)
+
 # --- Language (client-settable) --------------------------------------------
 #
 # Qwen3-ASR and OmniVoice both want a language *name* in English ("Turkish",
@@ -1382,6 +1424,27 @@ def build_chat_payload(messages, settings: dict) -> dict:
     return payload
 
 
+# llama.cpp reports an oversized prompt with both numbers in the body, which
+# is what makes the context size discoverable instead of configurable:
+#   {"type":"exceed_context_size_error","n_prompt_tokens":60019,"n_ctx":40192}
+CONTEXT_OVERFLOW_RE = re.compile(r'"n_ctx"\s*:\s*(\d+)')
+CONTEXT_OVERFLOW_MARKERS = ("exceed_context_size", "exceeds the available context",
+                            "context size", "too many tokens")
+
+
+def parse_context_overflow(message: str):
+    """Return the server's real context size if this was an overflow."""
+    lowered = (message or "").lower()
+    if not any(marker in lowered for marker in CONTEXT_OVERFLOW_MARKERS):
+        return None
+    found = CONTEXT_OVERFLOW_RE.search(message or "")
+    if found:
+        return int(found.group(1))
+    # Overflowed, but the server did not say by how much. Halving what we
+    # believed is a blunt but terminating way to converge.
+    return -1
+
+
 def stream_chat(messages, settings: dict):
     """Yield assistant content deltas from the streaming chat endpoint.
 
@@ -1390,11 +1453,34 @@ def stream_chat(messages, settings: dict):
     it never reaches the screen or the speaker.
     """
     url = settings["llm_url"] + LLM_CHAT_PATH
-    body = json.dumps(build_chat_payload(messages, settings)).encode("utf-8")
-    resp = _upstream_request(
-        url, data=body, method="POST",
-        headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
-        api_key=LLM_API_KEY, timeout=LLM_TIMEOUT)
+    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+
+    # One retry, and only for an oversized prompt. The estimate that chose the
+    # trim is approximate, so the first long conversation against an unfamiliar
+    # server can still overshoot; the error carries the real context size, so
+    # the retry is informed rather than hopeful, and every later turn is
+    # trimmed correctly in advance.
+    attempt = messages
+    resp = None
+    for retry in (False, True):
+        body = json.dumps(build_chat_payload(attempt, settings)).encode("utf-8")
+        try:
+            resp = _upstream_request(url, data=body, method="POST", headers=headers,
+                                     api_key=LLM_API_KEY, timeout=LLM_TIMEOUT)
+            break
+        except UpstreamError as exc:
+            limit = None if retry else parse_context_overflow(str(exc))
+            if limit is None:
+                raise
+            if limit < 0:
+                limit = max(1024, context_budget(settings) // 2)
+            remember_context_limit(settings, limit)
+            trimmed = trim_to_budget(attempt, context_budget(settings))
+            if len(trimmed) >= len(attempt):
+                raise            # nothing left to drop; the turn itself is too big
+            log("context overflow: server has %d tokens, retrying with %d of %d "
+                "messages" % (limit, len(trimmed), len(attempt)))
+            attempt = trimmed
     try:
         while True:
             line = resp.readline(MAX_SSE_LINE_BYTES)
@@ -1430,8 +1516,21 @@ class Session:
         self.sid = sid
         self.history = []          # [{"role": "user"|"assistant", "content": str}]
         self.cancelled = []        # turn ids Stop has revoked, newest last
+        self.history_start = 0     # first history entry still being replayed
         self.last_seen = time.monotonic()
         self.lock = threading.Lock()
+
+    def record_turn(self, user_text: str, reply: str) -> None:
+        """Append an exchange, keeping the stored history bounded."""
+        with self.lock:
+            self.history.append({"role": "user", "content": user_text})
+            self.history.append({"role": "assistant", "content": reply})
+            excess = len(self.history) - MAX_HISTORY_MESSAGES
+            if excess > 0:
+                del self.history[:excess]
+                # The anchor is an index into that list, so it has to move
+                # with it or it would silently point at the wrong turn.
+                self.history_start = max(0, self.history_start - excess)
 
     def cancel(self, turn: str) -> None:
         """Revoke a turn, so work still queued for it is dropped."""
@@ -1482,16 +1581,103 @@ class SessionStore:
 SESSIONS = SessionStore()
 
 
+# Context sizes learned from overflow errors, keyed by endpoint and model.
+# Shared across sessions because it is a property of the server, not the
+# conversation. Tiny and bounded by how many models you actually run.
+_CONTEXT_LIMITS = {}
+_CONTEXT_LOCK = threading.Lock()
+
+
+def estimate_tokens(messages) -> int:
+    """Approximate the prompt size without a round trip to the tokeniser."""
+    total = 0
+    for message in messages:
+        content = message.get("content") or ""
+        total += int(len(content) / CHARS_PER_TOKEN) + TOKENS_PER_MESSAGE
+    return total
+
+
+def context_budget(settings: dict) -> int:
+    """How many prompt tokens we are willing to send."""
+    key = (settings["llm_url"], settings["llm_model"])
+    with _CONTEXT_LOCK:
+        limit = _CONTEXT_LIMITS.get(key, ASSUMED_CONTEXT_TOKENS)
+    reserve = settings.get("max_tokens") or GENERATION_RESERVE_TOKENS
+    return max(512, limit - reserve - CONTEXT_SAFETY_TOKENS)
+
+
+def remember_context_limit(settings: dict, tokens: int) -> None:
+    key = (settings["llm_url"], settings["llm_model"])
+    with _CONTEXT_LOCK:
+        _CONTEXT_LIMITS[key] = tokens
+
+
+def trim_to_budget(messages, budget: int):
+    """Drop the oldest exchanges until the prompt fits, FIFO.
+
+    The system prompt and the current turn always survive -- without them
+    there is nothing to answer. Everything else goes oldest first, in pairs
+    where it can, so the history never starts on a dangling assistant reply.
+
+    Trimming overshoots deliberately: see TRIM_TARGET_RATIO. Stopping at the
+    budget would put us back over it next turn and destroy the prompt cache on
+    every turn thereafter.
+    """
+    if estimate_tokens(messages) <= budget:
+        return messages
+
+    head = messages[:1] if messages and messages[0]["role"] == "system" else []
+    tail = messages[-1:]                       # the turn being answered
+    middle = messages[len(head):len(messages) - 1]
+    target = max(1, int(budget * TRIM_TARGET_RATIO))
+
+    while middle and estimate_tokens(head + middle + tail) > target:
+        # Two at a time while the oldest is a user message, so a user turn
+        # and its reply leave together.
+        drop = 2 if len(middle) > 1 and middle[0]["role"] == "user" else 1
+        del middle[:drop]
+
+    return head + middle + tail
+
+
 def build_messages(session: Session, user_text: str, settings: dict):
-    """System prompt + trimmed history + this turn."""
-    messages = []
-    if settings.get("system_prompt"):
-        messages.append({"role": "system", "content": settings["system_prompt"]})
+    """System prompt + replayed history + this turn.
+
+    The start of the replayed history is sticky. Recomputing it from the end
+    each turn -- `history[-limit:]` -- slides the window forward by one
+    exchange every time, which changes the prompt prefix and costs a full
+    reprocess on every single turn. Here it only moves when the window has
+    outgrown its allowance, and then it jumps far enough back to stay put for
+    a long while.
+    """
+    system = ([{"role": "system", "content": settings["system_prompt"]}]
+              if settings.get("system_prompt") else [])
+    turn = [{"role": "user", "content": user_text}]
+    history = session.history
     limit = settings["history_messages"]
-    if limit > 0:
-        messages.extend(session.history[-limit:])
-    messages.append({"role": "user", "content": user_text})
-    return messages
+    budget = context_budget(settings)
+
+    start = min(session.history_start, len(history))
+
+    if limit <= 0:
+        start = len(history)
+    elif len(history) - start > limit * HISTORY_SLACK:
+        start = len(history) - limit
+
+    # Then the same again for tokens, which is the harder limit: exceeding it
+    # means the server refuses the request outright.
+    if estimate_tokens(system + history[start:] + turn) > budget:
+        target = max(1, int(budget * TRIM_TARGET_RATIO))
+        while (start < len(history)
+               and estimate_tokens(system + history[start:] + turn) > target):
+            start += 2 if history[start]["role"] == "user" else 1
+
+    # Never open on an assistant reply to a question that is no longer there.
+    if start < len(history) and history[start]["role"] != "user":
+        start += 1
+
+    session.history_start = start
+    return system + history[start:] + turn
 
 
 # ---------------------------------------------------------------------------
@@ -1886,6 +2072,7 @@ class Handler(BaseHTTPRequestHandler):
             session.cancel(turn)
         with session.lock:
             session.history = []
+            session.history_start = 0
         extra = {"Set-Cookie": cookie} if cookie else None
         return self._send_json(200, {"ok": True}, extra_headers=extra)
 
@@ -2016,12 +2203,7 @@ class Handler(BaseHTTPRequestHandler):
 
             full = "".join(visible).strip()
             if full:
-                with session.lock:
-                    session.history.append({"role": "user", "content": text})
-                    session.history.append({"role": "assistant", "content": full})
-                    # Keep RAM bounded regardless of what the client asks for.
-                    if len(session.history) > MAX_HISTORY_MESSAGES:
-                        del session.history[:-MAX_HISTORY_MESSAGES]
+                session.record_turn(text, full)
             emit("done", {"text": full, "sentences": index})
 
         except Aborted:
